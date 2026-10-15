@@ -1,0 +1,317 @@
+/**
+ * Inbound git sync: mirror *.md from a source's pinned branch into the
+ * doc store, then enqueue reindex.
+ *
+ * Idempotent + change-aware: a doc whose stored blob sha matches the
+ * tree entry is skipped (no fetch, no reindex). Docs with unmerged local
+ * work (local_edits / pr_open) are marked `conflict` rather than
+ * clobbered. Vanished blobs soft-delete their (clean) docs.
+ *
+ * Git-synced docs store raw markdown as the canonical body
+ * (docs/{docId}/source.md); the reindex consumer chunks it directly and
+ * the editor materialises BlockNote blocks lazily on first open.
+ */
+
+import type { Env } from '../env'
+import type { GitSyncInterval, GitSyncResult } from '@ctxlayer/shared'
+import { DOC_LIMITS, clampText, parseFrontmatter, slugifyHeading } from '@ctxlayer/shared'
+import { applyOkfMetadata } from '../docs/okf-import'
+import {
+  getGitSourceById,
+  listEnabledGitSources,
+  listGitDocPaths,
+  markDocGitOrigin,
+  patchGitSource,
+  recordSyncResult,
+  setDocGitSyncState,
+  type GitSourceRow
+} from '../db/queries/git-sources'
+import { findById as findUserById } from '../db/queries/users'
+import { createDoc, softDeleteDoc } from '../db/queries/docs'
+import { setDocProductTag } from '../db/queries/doc-tags'
+import { writeSourceMarkdown } from '../storage/docs-r2'
+import { createGitProvider } from './provider'
+import type { GitRepoConfig } from './provider-types'
+import { resolveGitReadToken } from './credentials'
+import { errMessage } from '../util/errors'
+
+export interface RunGitSyncOpts {
+  /** Acting user, for user_* read strategies (interactive sync). */
+  userId?: string
+}
+
+// Minimum elapsed seconds between scheduled syncs per cadence. The
+// hourly cron enqueues a source only once its interval has elapsed.
+const SYNC_GAP_SECONDS: Record<GitSyncInterval, number> = {
+  hourly: 3600,
+  '6x_daily': 4 * 3600,
+  '2x_daily': 12 * 3600,
+  daily: 24 * 3600,
+  weekly: 7 * 24 * 3600
+}
+
+/**
+ * Whether a source is due for a scheduled sync. A 5-minute slack absorbs
+ * cron jitter so a source that synced 59½ minutes ago isn't skipped on
+ * the next hourly tick. Never-synced sources are always due.
+ */
+export function isGitSyncDue(
+  interval: GitSyncInterval,
+  lastSyncedAt: number | null,
+  nowSec: number
+): boolean {
+  if (lastSyncedAt == null) return true
+  const gap = SYNC_GAP_SECONDS[interval] ?? SYNC_GAP_SECONDS.daily
+  return nowSec - lastSyncedAt >= gap - 300
+}
+
+/** One scheduled sync the cron should enqueue: the source + the identity to act as. */
+export interface DueGitSync {
+  sourceId: string
+  slug: string
+  /** Set for user_* read strategies — the designated sync identity. */
+  userId?: string
+}
+
+/**
+ * The syncs the hourly cron should enqueue right now: enabled + due, and
+ * holding an unattended credential path. That's shared_bearer (org token,
+ * no acting user needed), or a user_* read strategy whose owner
+ * self-designated a sync identity (`sync_as_user_id`) — the cron then acts
+ * with that user's stored git credential. A designee that is missing or no
+ * longer active is SKIPPED with a log line, never acted as: revocation and
+ * suspend must bite scheduled jobs the way they bite live sessions (A6).
+ */
+export async function listDueGitSyncs(
+  env: Env,
+  nowSec: number
+): Promise<{ due: DueGitSync[]; total: number }> {
+  const sources = await listEnabledGitSources(env)
+  const due: DueGitSync[] = []
+  for (const s of sources) {
+    if (!isGitSyncDue(s.sync_interval, s.last_synced_at, nowSec)) continue
+    if (s.read_strategy === 'shared_bearer') {
+      due.push({ sourceId: s.id, slug: s.slug })
+      continue
+    }
+    if (!s.sync_as_user_id) continue
+    const designee = await findUserById(env, s.sync_as_user_id)
+    if (!designee || designee.status !== 'active') {
+      console.warn(
+        `[cron] git-sync: skipping ${s.slug} — designated sync user is missing or inactive`
+      )
+      continue
+    }
+    due.push({ sourceId: s.id, slug: s.slug, userId: s.sync_as_user_id })
+  }
+  return { due, total: sources.length }
+}
+
+const ZERO = { created: 0, updated: 0, deleted: 0, skipped: 0, conflicts: 0 }
+
+/** A provider "branch not found" signal — `<provider>_ref_unresolved`. */
+function isRefUnresolved(err: unknown): boolean {
+  return err instanceof Error && /_ref_unresolved$/.test(err.message)
+}
+
+export async function runGitSync(
+  env: Env,
+  sourceId: string,
+  opts: RunGitSyncOpts = {}
+): Promise<GitSyncResult> {
+  const source = await getGitSourceById(env, sourceId)
+  if (!source) return { status: 'error', ...ZERO, error: 'source_not_found' }
+  if (source.enabled !== 1) return { status: 'error', ...ZERO, error: 'source_disabled' }
+
+  const token = await resolveGitReadToken(env, source, { userId: opts.userId })
+  if (!token) {
+    await recordSyncResult(env, sourceId, 'error', 'no_read_token')
+    return { status: 'error', ...ZERO, error: 'no_read_token' }
+  }
+
+  const provider = createGitProvider(repoConfig(source), token)
+  const counts = { ...ZERO }
+
+  try {
+    // Blank branch ⇒ auto-detect the repo's default and persist it (so the
+    // drawer reflects it + future syncs are stable). Avoids the old silent
+    // 'main' default that broke ADO repos defaulting to 'master'.
+    let branch = source.branch.trim()
+    if (!branch) {
+      const def = await provider.getDefaultBranch()
+      if (!def) throw new Error('repo_no_default_branch')
+      branch = def
+      await patchGitSource(env, sourceId, { branch })
+    }
+
+    // A configured-but-missing branch becomes a friendly, default-naming
+    // error (branch_not_found:<typed>:<default>) instead of the opaque
+    // <provider>_ref_unresolved.
+    let headSha: string
+    try {
+      headSha = await provider.resolveRef(branch)
+    } catch (err) {
+      if (isRefUnresolved(err)) {
+        const def = await provider.getDefaultBranch().catch(() => null)
+        throw new Error(`branch_not_found:${branch}:${def ?? ''}`)
+      }
+      throw err
+    }
+
+    const entries = await provider.listMarkdownTree(branch, source.path_prefix)
+    const existing = await listGitDocPaths(env, sourceId)
+    // One read up front instead of a per-path lookup per tree entry —
+    // a no-op sync over a large repo used to cost one D1 round trip
+    // per markdown file.
+    const docByPath = new Map(existing.map((e) => [e.git_path, e]))
+    const seen = new Set<string>()
+
+    for (const entry of entries) {
+      seen.add(entry.path)
+      const doc = docByPath.get(entry.path) ?? null
+
+      const action = syncActionFor(doc, entry.blobSha)
+      if (action === 'skip') {
+        counts.skipped++
+        continue
+      }
+      if (action === 'conflict') {
+        await setDocGitSyncState(env, doc!.id, 'conflict')
+        counts.conflicts++
+        continue
+      }
+
+      const file = await provider.readFile(entry.path, branch)
+      await importGitFile(
+        env,
+        source,
+        { path: entry.path, text: file.text, blobSha: entry.blobSha },
+        headSha,
+        doc?.id
+      )
+      if (action === 'update') counts.updated++
+      else counts.created++
+    }
+
+    // Deletions: a doc whose path no longer appears in the tree. Only
+    // drop clean docs — anything with local edits / an open PR is left
+    // for the operator to resolve.
+    for (const e of existing) {
+      if (seen.has(e.git_path)) continue
+      if (e.git_sync_state === null || e.git_sync_state === 'clean') {
+        await softDeleteDoc(env, e.id)
+        counts.deleted++
+      }
+    }
+
+    const status: GitSyncResult['status'] = counts.conflicts > 0 ? 'partial' : 'ok'
+    await recordSyncResult(env, sourceId, status, null)
+    return { status, ...counts, error: null }
+  } catch (err) {
+    const msg = errMessage(err)
+    await recordSyncResult(env, sourceId, 'error', msg)
+    return { status: 'error', ...counts, error: msg }
+  }
+}
+
+/**
+ * What the sync loop does with one tree entry, given the doc that path
+ * currently maps to. 'conflict' is the don't-clobber branch: the doc holds
+ * unmerged local work (local_edits / pr_open) — or is ALREADY flagged
+ * 'conflict', which must stay in this set or the flag only survives one
+ * pass and the next sync silently overwrites source.md underneath the
+ * stale collab snapshot. Resolution is always explicit: write back via
+ * PR, or POST /:id/git/revert.
+ */
+export function syncActionFor(
+  doc: { git_blob_sha: string | null; git_sync_state: string | null } | null,
+  blobSha: string
+): 'create' | 'skip' | 'conflict' | 'update' {
+  if (!doc) return 'create'
+  if (doc.git_blob_sha === blobSha) return 'skip'
+  if (
+    doc.git_sync_state === 'local_edits' ||
+    doc.git_sync_state === 'pr_open' ||
+    doc.git_sync_state === 'conflict'
+  ) {
+    return 'conflict'
+  }
+  return 'update'
+}
+
+/**
+ * Import one repo file into its doc: create the doc when needed, overwrite
+ * source.md with the EXACT repo file (incl. frontmatter — it's the
+ * write-back diff baseline; the reindex consumer strips frontmatter before
+ * chunking), stamp the git origin (state → clean), project the OKF fields,
+ * re-tag with the source's product (set BEFORE the reindex enqueue so the
+ * consumer's tag read picks it up; null clears), and enqueue the reindex.
+ * Shared by the sync loop above and the revert endpoint (api/git.ts) so
+ * the two import paths can't drift. Returns the doc id.
+ */
+export async function importGitFile(
+  env: Env,
+  source: GitSourceRow,
+  file: { path: string; text: string; blobSha: string },
+  commitSha: string,
+  existingDocId?: string
+): Promise<string> {
+  // Parse OKF frontmatter once: title falls back to the body's H1, the
+  // well-known fields land on the doc, the rest is preserved verbatim.
+  const fm = parseFrontmatter(file.text)
+  let docId = existingDocId
+  if (!docId) {
+    const created = await createDoc(env, {
+      title: clampText(fm.known.title?.trim() || deriveTitle(fm.body, file.path), DOC_LIMITS.title),
+      folder: repoPathToFolder(source.folder_root, file.path),
+      createdBy: source.created_by
+    })
+    docId = created.id
+  }
+  await writeSourceMarkdown(env, docId, file.text)
+  await markDocGitOrigin(env, docId, {
+    sourceId: source.id,
+    path: file.path,
+    blobSha: file.blobSha,
+    commitSha
+  })
+  await applyOkfMetadata(env, docId, fm.known, fm.raw)
+  await setDocProductTag(env, docId, source.product_id)
+  await env.DOC_REINDEX_QUEUE.send({ docId, revisionId: commitSha, source: 'git' })
+  return docId
+}
+
+function repoConfig(s: GitSourceRow): GitRepoConfig {
+  return {
+    provider: s.provider,
+    baseUrl: s.base_url,
+    owner: s.owner,
+    project: s.project,
+    repo: s.repo
+  }
+}
+
+/** Title from the first H1, else the filename sans markdown extension. */
+function deriveTitle(markdown: string, path: string): string {
+  const h1 = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim()
+  if (h1) return h1.slice(0, 200)
+  const base = path.split('/').pop() ?? path
+  return base.replace(/\.(md|mdown|markdown|mkd)$/i, '') || path
+}
+
+/**
+ * Map a repo file path to a ctxlayer folder under `folderRoot`. Segments
+ * are slugified (non-slug repo dirs become slug-shaped) and capped at
+ * depth 5 to satisfy FolderPath. The true repo path is preserved on the
+ * doc's git_path regardless; this is only for browse grouping.
+ */
+function repoPathToFolder(folderRoot: string, repoPath: string): string | null {
+  const dir = repoPath.includes('/') ? repoPath.slice(0, repoPath.lastIndexOf('/')) : ''
+  const rootSegs = folderRoot
+    .replace(/^\/+|\/+$/g, '')
+    .split('/')
+    .filter(Boolean)
+  const dirSegs = dir.split('/').filter(Boolean)
+  const segs = [...rootSegs, ...dirSegs].map(slugifyHeading).filter(Boolean).slice(0, 5)
+  return segs.length === 0 ? null : `/${segs.join('/')}`
+}

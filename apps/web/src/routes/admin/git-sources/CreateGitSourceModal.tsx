@@ -1,0 +1,193 @@
+import { useState } from 'react'
+import { Alert, Group, Select, Text, TextInput } from '@mantine/core'
+import type { GitProvider, ProductRef } from '@ctxlayer/shared'
+import { FormModalShell } from '../../../components/form-modal-shell'
+import { adminCreateGitSource } from '../../../lib/api'
+import { parseGitUrl, type ParsedGitUrl } from '../../../lib/git-url'
+import { useBusyAction } from '../../../lib/use-busy'
+import { explain } from './helpers'
+
+/** When set, the new repo joins an existing connection (auth inherited). */
+export interface AttachTarget {
+  connectionId: string
+  provider: GitProvider
+  displayName: string
+}
+
+// Conditionally mounted by the caller (`{createOpen && …}`), so all state
+// resets for free on close — no `opened` prop / reset effect.
+export function CreateGitSourceModal({
+  products,
+  attachTo,
+  onClose,
+  onCreated
+}: {
+  products: ProductRef[] | null
+  attachTo?: AttachTarget
+  onClose: () => void
+  onCreated: (id: string) => void
+}) {
+  // The repo URL drives everything — provider, host, owner, repo, and
+  // (for /tree/ links) branch + folder are derived from it. Only the
+  // non-derivable bits stay as fields; strategies + cadence default and
+  // are editable in the drawer afterwards.
+  const [url, setUrl] = useState('')
+  const [parsed, setParsed] = useState<ParsedGitUrl | null>(null)
+  // Blank = auto-detect the repo's default branch on first sync (don't assume
+  // 'main' — ADO repos commonly default to 'master').
+  const [branch, setBranch] = useState('')
+  const [folder, setFolder] = useState('')
+  const [displayName, setDisplayName] = useState('')
+  const [slug, setSlug] = useState('')
+  const [productId, setProductId] = useState<string | null>(null)
+  // Once the user edits an auto-filled field, stop overwriting it.
+  const [nameTouched, setNameTouched] = useState(false)
+  const [slugTouched, setSlugTouched] = useState(false)
+  const [branchTouched, setBranchTouched] = useState(false)
+  const [folderTouched, setFolderTouched] = useState(false)
+  const { busy, error, run: withBusy } = useBusyAction({ explain })
+
+  function onUrlChange(value: string) {
+    setUrl(value)
+    const p = parseGitUrl(value)
+    setParsed(p)
+    if (!p) return
+    if (!nameTouched) setDisplayName(p.owner ? `${p.owner}/${p.repo}` : p.repo)
+    if (!slugTouched) setSlug(p.slugSuggestion)
+    // Only adopt a branch the URL actually carried (/tree/<branch>); otherwise
+    // leave it blank for auto-detect.
+    if (!branchTouched) setBranch(p.branch ?? '')
+    if (!folderTouched) setFolder(p.pathPrefix)
+  }
+
+  // When attaching, the pasted repo must be on the connection's provider.
+  const providerMismatch = !!attachTo && !!parsed && parsed.provider !== attachTo.provider
+  // Branch is optional now (blank = auto-detect), so it's not a submit gate.
+  const canSubmit = !!parsed && !!slug.trim() && !!displayName.trim() && !providerMismatch
+
+  async function submit() {
+    if (!parsed || !canSubmit) return
+    await withBusy(async () => {
+      const created = await adminCreateGitSource({
+        slug: slug.trim(),
+        displayName: displayName.trim(),
+        provider: parsed.provider,
+        baseUrl: parsed.baseUrl ?? undefined,
+        connectionId: attachTo?.connectionId,
+        owner: parsed.owner || undefined,
+        project: parsed.project || undefined,
+        repo: parsed.repo,
+        branch: branch.trim() || undefined,
+        pathPrefix: folder.trim() || undefined,
+        productId,
+        enabled: true
+      })
+      onCreated(created.id)
+    }, 'Create')
+  }
+
+  return (
+    <FormModalShell
+      title={attachTo ? `Add repo to ${attachTo.displayName}` : 'New git source'}
+      size="lg"
+      error={error}
+      busy={busy}
+      submitLabel="Create"
+      submitDisabled={!canSubmit}
+      onSubmit={submit}
+      onClose={onClose}
+    >
+      {attachTo && (
+        <Alert color="blue" variant="light" radius="sm">
+          This repo joins the <strong>{attachTo.displayName}</strong> connection — its OAuth / token
+          / visibility are inherited. Paste a <strong>{attachTo.provider}</strong> repo URL.
+        </Alert>
+      )}
+      <TextInput
+        label="Git repo URL"
+        placeholder="https://github.com/acme/docs  (or …/tree/main/docs)"
+        description="Paste the repo URL. Provider, owner, repo — and branch + folder from a /tree/ link — are filled in automatically."
+        value={url}
+        onChange={(e) => onUrlChange(e.currentTarget.value)}
+        error={
+          url.trim() && !parsed
+            ? 'Not a recognizable git repo URL'
+            : providerMismatch
+              ? `That's a ${parsed?.provider} URL, but this connection is ${attachTo?.provider}.`
+              : undefined
+        }
+        data-autofocus
+      />
+
+      {parsed && (
+        <Text fz="xs" c="dimmed">
+          {`Detected: ${parsed.provider}${parsed.baseUrl ? ` (${parsed.baseUrl})` : ''} · ${
+            parsed.owner ? `${parsed.owner}/` : ''
+          }${parsed.repo}`}
+        </Text>
+      )}
+
+      <Group grow>
+        <TextInput
+          label="Branch (optional)"
+          placeholder="auto-detect"
+          description="Blank = use the repo's default branch (e.g. main / master). Case-sensitive."
+          value={branch}
+          onChange={(e) => {
+            setBranchTouched(true)
+            setBranch(e.currentTarget.value)
+          }}
+        />
+        <TextInput
+          label="Folder (optional)"
+          placeholder="docs/billing"
+          description="Limit the sync to a subfolder — e.g. for multi-product repos."
+          value={folder}
+          onChange={(e) => {
+            setFolderTouched(true)
+            setFolder(e.currentTarget.value)
+          }}
+        />
+      </Group>
+
+      <Select
+        label="Product (optional)"
+        placeholder="None"
+        description="Synced docs are auto-tagged with this product, scoping search to the right users."
+        data={(products ?? []).map((p) => ({ value: p.id, label: p.displayName }))}
+        value={productId}
+        onChange={setProductId}
+        clearable
+        searchable
+      />
+
+      <Group grow>
+        <TextInput
+          label="Display name"
+          placeholder="acme/docs"
+          value={displayName}
+          onChange={(e) => {
+            setNameTouched(true)
+            setDisplayName(e.currentTarget.value)
+          }}
+        />
+        <TextInput
+          label="Slug"
+          placeholder="repo-docs"
+          description="Auto-filled from the repo; edit to customise. Must start with repo-."
+          value={slug}
+          onChange={(e) => {
+            setSlugTouched(true)
+            setSlug(e.currentTarget.value)
+          }}
+        />
+      </Group>
+
+      <Text fz="xs" c="dimmed">
+        {attachTo
+          ? 'Auth is inherited from the connection. Adjust cadence / folder / product in the drawer after creating.'
+          : 'After creating, set the read token + adjust credential strategy / cadence in the drawer.'}
+      </Text>
+    </FormModalShell>
+  )
+}

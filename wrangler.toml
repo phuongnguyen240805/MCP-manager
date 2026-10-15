@@ -1,0 +1,245 @@
+name = "ctxlayer"
+main = "apps/worker/src/index.ts"
+compatibility_date = "2026-04-01"
+# nodejs_compat: stdlib shims (`crypto`, `buffer`, etc.) we rely on
+#   in the agents SDK + workers-oauth-provider.
+# global_fetch_strictly_public: enables CIMD (Client ID Metadata
+#   Document) lookups in workers-oauth-provider so it can validate
+#   DCR-registered clients without re-fetching from internal IPs.
+compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
+
+# Workers Logs: stream console.log + invocation metadata to the
+# Cloudflare dashboard (Workers → ctxlayer → Logs). Required for
+# debugging anything that doesn't surface via /smoke.
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# SPA shipped from this Worker. The `dist` directory is produced by
+# `bun run build:web`; `scripts/ensure-dist.mjs` lays down a placeholder
+# index.html on cold checkouts so `wrangler dev` and `wrangler deploy`
+# don't fail before the first real build.
+#
+# `not_found_handling = "single-page-application"` tells Workers Assets
+# to serve `index.html` for unknown SPA paths, replacing the old
+# hand-rolled fallback in apps/worker/src/index.ts. API/MCP/oauth routes
+# are listed in `run_worker_first` so the Worker handles them before
+# the asset resolver gets a chance.
+[assets]
+directory = "./apps/web/dist"
+not_found_handling = "single-page-application"
+run_worker_first = [
+  "/api/*",
+  "/mcp",
+  "/mcp/*",
+  "/sse",
+  "/sse/*",
+  "/oauth/*",
+  "/idp/*",
+  "/collab/*",
+  "/.well-known/*"
+]
+
+# ---------------------------------------------------------------------------
+# Bindings. The ids below are THIS deployment's — a fork provisions its own.
+#
+# An all-zeros id (`00000000-0000-0000-0000-000000000000`) is the placeholder
+# `bun run bootstrap` looks for; it provisions the resource and writes the real
+# id back here. Zero out `database_id` + the OAUTH_KV `id` to re-run it against
+# a fresh Cloudflare account. Equivalent manual steps:
+#   wrangler d1 create ctxlayer
+#   wrangler kv namespace create OAUTH_KV
+#   wrangler r2 bucket create ctxlayer-docs
+#   wrangler vectorize create ctxlayer-docs --dimensions 768 --metric cosine
+#   wrangler vectorize create ctxlayer-docs-lexical --dimensions 1536 --metric cosine
+# ---------------------------------------------------------------------------
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ctxlayer"
+database_id = "c26162b8-8840-44f4-9e76-12a63d0c094a"
+migrations_dir = "apps/worker/src/db/migrations"
+
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "26fde346650d4f5d9fe0ae7d9a1c842e"
+
+[[r2_buckets]]
+binding = "DOCS_BUCKET"
+bucket_name = "ctxlayer-docs"
+
+[[vectorize]]
+binding = "DOCS_INDEX"
+index_name = "ctxlayer-docs"
+# Note: `remote = true` would silence the "no local emulator"
+# warning by attaching the binding to the deployed worker's edge
+# preview — but that requires the script to have been deployed
+# first (chicken-and-egg on a fresh checkout). Left off so
+# `bun run dev` works straight through; the reindex consumer
+# soft-skips the resulting "needs to be run remotely" error in
+# dev (see queues/reindex-consumer.ts). For RAG validation use
+# `wrangler dev --remote` or deploy.
+
+# Hybrid keyword recall: a second index holding lexical (hashing-trick)
+# vectors — see rag/lexical-embed.ts. The code guards on this binding, so
+# search degrades to dense-only until it's provisioned. To enable:
+#   wrangler vectorize create ctxlayer-docs-lexical --dimensions 1536 --metric cosine
+# then redeploy and run a full reindex (POST /api/admin/docs/reindex) to
+# populate it.
+[[vectorize]]
+binding = "DOCS_LEXICAL_INDEX"
+index_name = "ctxlayer-docs-lexical"
+
+[ai]
+binding = "AI"
+# Workers AI runs on Cloudflare's infrastructure; there is no local
+# model server. The dev-warning is cosmetic — calls still proxy to
+# the real account from `wrangler dev`. `remote = true` would
+# silence the warning but requires a previously-deployed worker
+# script, which we don't want to require for local iteration.
+
+[[durable_objects.bindings]]
+name = "MCP_SESSION_DO"
+class_name = "McpSessionDO"
+
+[[durable_objects.bindings]]
+name = "DOC_ROOM_DO"
+class_name = "DocRoomDO"
+
+# Durable Object class migrations.
+# `McpSessionDO` is SQLite-backed because it extends `McpAgent` from
+# the `agents` SDK (uses `ctx.storage.sql` for session state).
+# `DocRoomDO` stays non-SQLite until M3 wires real Yjs persistence.
+# Storage backend is sticky once a class is created on the account.
+[[migrations]]
+tag = "v1"
+new_classes = ["DocRoomDO"]
+new_sqlite_classes = ["McpSessionDO"]
+
+[[queues.producers]]
+binding = "USAGE_QUEUE"
+queue = "ctxlayer-usage"
+
+[[queues.producers]]
+binding = "DOC_REINDEX_QUEUE"
+queue = "ctxlayer-reindex"
+
+[[queues.producers]]
+binding = "GIT_SYNC_QUEUE"
+queue = "ctxlayer-git-sync"
+
+[[queues.producers]]
+binding = "JOBS_QUEUE"
+queue = "ctxlayer-jobs"
+
+# max_retries bounds the redelivery budget so a poison message (incl. the
+# unknown-queue branch in index.ts) can't retry forever. Consumers alert on the
+# final attempt rather than letting the platform silently drop (ops/alert.ts).
+[[queues.consumers]]
+queue = "ctxlayer-usage"
+max_batch_size = 100
+max_batch_timeout = 5
+max_retries = 5
+
+[[queues.consumers]]
+queue = "ctxlayer-reindex"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 5
+
+# Git mirror sync. One message per source per run; the consumer walks
+# the repo tree, imports changed *.md, and enqueues reindex. Small batch
+# + generous timeout because a single source can touch many files.
+[[queues.consumers]]
+queue = "ctxlayer-git-sync"
+max_batch_size = 5
+max_batch_timeout = 30
+max_retries = 5
+
+# Async upstream tool calls (submit→poll). One job per invocation
+# (max_batch_size = 1) so a 2-3 min call gets the whole consumer wall-clock to
+# itself. Low retries: runJob makes tool failures TERMINAL (acked), so a retry
+# only happens on an unexpected infra throw.
+[[queues.consumers]]
+queue = "ctxlayer-jobs"
+max_batch_size = 1
+max_batch_timeout = 5
+max_retries = 3
+
+[triggers]
+# Nightly (03:00): prune usage_events + orphan oauth clients.
+# Hourly: git-sync due-check — enqueues shared_bearer sources whose
+# sync_interval has elapsed (see the scheduled handler in index.ts).
+crons = ["0 3 * * *", "0 * * * *"]
+
+# Local HTTPS for dev. mkcert-generated cert lives in .dev-tls/ (gitignored);
+# `scripts/setup-dev-tls.mjs` runs as the `predev` hook on both worker and
+# web. HTTPS is required because the `__Host-` session cookie prefix mandates
+# Secure, which browsers only honour over HTTPS.
+#
+# The cert paths must be passed via CLI flags (`--https-key-path` /
+# `--https-cert-path`) — wrangler 4 doesn't read them from this TOML block.
+# See apps/worker/package.json's `dev` script.
+[dev]
+ip = "localhost"
+port = 8787
+local_protocol = "https"
+
+[vars]
+# Placeholder for the public template. The real deployment origin is injected
+# at deploy time by `scripts/deploy.mjs` from a gitignored `.prod.vars`
+# (`--var PUBLIC_BASE_URL:…`), so this committed value is never shipped.
+# For local dev, `.dev.vars` overrides it with https://localhost:8787.
+PUBLIC_BASE_URL = "https://YOUR-WORKER.example.workers.dev"
+# Build provenance, surfaced on /api/version + /api/health. Empty by
+# default (local dev / a bare `wrangler deploy`); the `deploy` script
+# overrides both with `--var` from `git rev-parse` + a UTC timestamp.
+GIT_SHA = ""
+BUILT_AT = ""
+# Org-facing alias for this gateway — the connector name the org configured
+# in its MCP clients (e.g. "Yuki MCP"). Woven into the MCP server
+# instructions so agents know the alias and "ctxlayer" are the same gateway.
+# Empty ⇒ no alias clause.
+GATEWAY_ALIAS = ""
+# Google sign-in is enabled if EITHER allowlist is set. A user passes
+# the allowlist when their id_token.hd matches ALLOWED_GOOGLE_HD OR
+# their email is in ALLOWED_GOOGLE_EMAILS. Both empty disables Google.
+ALLOWED_GOOGLE_HD = ""               # e.g. "acme.com" (Workspace hosted domain)
+ALLOWED_GOOGLE_EMAILS = ""           # comma-separated emails for solo / personal accounts
+# GitHub sign-in is enabled if EITHER allowlist is set. A user passes
+# when they're a member of ALLOWED_GITHUB_ORG OR their login is in
+# ALLOWED_GITHUB_USERS. Both empty disables GitHub.
+ALLOWED_GITHUB_ORG = ""              # e.g. "acme-inc" (org slug)
+# Personal-login allowlist. Like PUBLIC_BASE_URL, the committed value is an
+# empty placeholder; the real prod value is injected at deploy time by
+# scripts/deploy.mjs from a gitignored `.prod.vars` (so logins aren't
+# committed), and `.dev.vars` supplies it for local dev.
+ALLOWED_GITHUB_USERS = ""            # e.g. "octocat,hubot" (comma-sep GitHub logins)
+# Admission policy (plan L). How an authenticated-but-not-explicitly-allowlisted
+# identity is treated:
+#   open_domain (default) — the allowlists above ARE the gate; a match admits
+#                           as `active`, everyone else is rejected. Legacy
+#                           behaviour; leave this unless you want a signup queue.
+#   request               — opens an admin-approval queue (Admin · Users ›
+#                           Pending). Members-only when ALLOWED_GITHUB_ORG /
+#                           ALLOWED_GOOGLE_HD is set (outsiders rejected);
+#                           OPEN (anyone who can sign in lands pending) when no
+#                           org/domain boundary is configured.
+#   invite                — invite/join-code only; unknowns rejected.
+# Invites + join codes (Admin · Invites / Join codes) admit directly under ANY
+# policy. Like ALLOWED_GITHUB_USERS, the real value can be injected at deploy
+# from `.prod.vars` by scripts/deploy.mjs, so this committed default stays
+# generic.
+ACCESS_POLICY = "open_domain"        # open_domain | request | invite
+# Consent interstitial (July review §1e): /oauth/authorize always shows an
+# approve/deny page naming the client — including on Cloudflare-Access-fronted
+# deploys, where the edge identity turns it into a plain Approve/Deny (no IdP
+# chooser). A deploy that treats the Access gate itself as consent can restore
+# zero-click MCP authorization by injecting OAUTH_CONSENT_SKIP_VIA_ACCESS = "1"
+# (a [var], e.g. via .prod.vars + scripts/deploy.mjs, like PUBLIC_BASE_URL).
+# ADMIN_EMAILS is the one binding still set via `wrangler secret put` (admin
+# identity, not an allowlist); in local dev `.dev.vars` supplies it. Declaring
+# an empty default here would block the secret with code 10053 ("binding name
+# already in use") — the same trap now applies in reverse to
+# ALLOWED_GITHUB_USERS, so delete any old ALLOWED_GITHUB_USERS secret before the
+# first deploy that injects the var.

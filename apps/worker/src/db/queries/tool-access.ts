@@ -1,0 +1,126 @@
+/**
+ * D1 queries for `tool_access` — the per-tool ACL layer that refines
+ * upstream visibility. See packages/shared/src/tool-access.ts for the
+ * semantics + the pure `isToolAllowed` / `requiresFromRules` evaluators
+ * this module's rows feed into.
+ *
+ * Rows reference a tool by NAME (no FK to upstream_tools — the catalogue
+ * is rebuilt on every refresh; an FK would cascade-wipe ACLs). The
+ * upstream FK handles cleanup.
+ */
+
+import type { Env } from '../../env'
+import type {
+  ToolAccessPrincipalKind,
+  ToolAccessRule,
+  ToolAccessRuleLike,
+  UserPrincipals
+} from '@ctxlayer/shared'
+import { resolveUserScope } from './doc-tags'
+import { listUserRoleIds } from './roles'
+
+/**
+ * The caller's group memberships (teams, products, roles), resolved in one
+ * pass for the per-tool ACL. Products are transitive via teams
+ * (`resolveUserScope`); roles are direct.
+ *
+ * Single source of truth for the principal set: the MCP proxy, `/api/tools`,
+ * and the skill drafter all evaluate `isToolAllowed` against THIS shape, so a
+ * divergence here would silently widen or narrow one surface relative to the
+ * others.
+ */
+export async function resolveUserPrincipals(env: Env, userId: string): Promise<UserPrincipals> {
+  const [scope, roleIds] = await Promise.all([
+    resolveUserScope(env, userId),
+    listUserRoleIds(env, userId)
+  ])
+  return { teams: new Set(scope.teams), products: new Set(scope.products), roles: new Set(roleIds) }
+}
+
+export interface ToolAccessRow {
+  upstream_id: string
+  tool_name: string
+  principal_kind: ToolAccessPrincipalKind
+  principal_id: string
+}
+
+/** Stable map key for a (upstream, tool) pair. NUL can't appear in a slug or tool name. */
+export const accessKey = (upstreamId: string, toolName: string): string =>
+  `${upstreamId}\u0000${toolName}`
+
+export async function listToolAccessForUpstream(
+  env: Env,
+  upstreamId: string
+): Promise<ToolAccessRow[]> {
+  const res = await env.DB.prepare(
+    `SELECT upstream_id, tool_name, principal_kind, principal_id
+     FROM tool_access WHERE upstream_id = ?1
+     ORDER BY tool_name`
+  )
+    .bind(upstreamId)
+    .all<ToolAccessRow>()
+  return res.results ?? []
+}
+
+export async function listToolAccessForUpstreams(
+  env: Env,
+  upstreamIds: string[]
+): Promise<ToolAccessRow[]> {
+  if (upstreamIds.length === 0) return []
+  const placeholders = upstreamIds.map((_, i) => `?${i + 1}`).join(', ')
+  const res = await env.DB.prepare(
+    `SELECT upstream_id, tool_name, principal_kind, principal_id
+     FROM tool_access WHERE upstream_id IN (${placeholders})`
+  )
+    .bind(...upstreamIds)
+    .all<ToolAccessRow>()
+  return res.results ?? []
+}
+
+/**
+ * Replace the ENTIRE rule set for one tool on one upstream. Empty
+ * `rules` reverts the tool to inherit (open). Single batch so the rule
+ * set is never partially applied. `everyone` rules store '' for
+ * principal_id; any other kind with a null/empty id is skipped.
+ */
+export async function replaceToolAccessForTool(
+  env: Env,
+  upstreamId: string,
+  toolName: string,
+  rules: ToolAccessRule[]
+): Promise<void> {
+  const now = Math.floor(Date.now() / 1000)
+  const stmts: D1PreparedStatement[] = [
+    env.DB.prepare(`DELETE FROM tool_access WHERE upstream_id = ?1 AND tool_name = ?2`).bind(
+      upstreamId,
+      toolName
+    )
+  ]
+  for (const r of rules) {
+    const principalId = r.principalKind === 'everyone' ? '' : (r.principalId ?? '')
+    if (r.principalKind !== 'everyone' && !principalId) continue
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO tool_access (upstream_id, tool_name, principal_kind, principal_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (upstream_id, tool_name, principal_kind, principal_id) DO NOTHING`
+      ).bind(upstreamId, toolName, r.principalKind, principalId, now)
+    )
+  }
+  await env.DB.batch(stmts)
+}
+
+/**
+ * Group rows by (upstream, tool) into the rule-like shape the shared
+ * `isToolAllowed` evaluator consumes. Key via {@link accessKey}.
+ */
+export function indexToolAccess(rows: ToolAccessRow[]): Map<string, ToolAccessRuleLike[]> {
+  const out = new Map<string, ToolAccessRuleLike[]>()
+  for (const r of rows) {
+    const key = accessKey(r.upstream_id, r.tool_name)
+    const arr = out.get(key) ?? []
+    arr.push({ principalKind: r.principal_kind, principalId: r.principal_id })
+    out.set(key, arr)
+  }
+  return out
+}

@@ -1,0 +1,462 @@
+/**
+ * D1 queries for upstream credentials: per-user rows (`user_credentials`,
+ * bearer or sealed OAuth token sets) and org-wide rows
+ * (`upstream_shared_credentials`, shared_bearer strategy). Also home to
+ * the user_oauth refresh-lease (single-flight token refresh) and the
+ * reauth-required flag that the SPA surfaces as "reconnect needed".
+ *
+ * Credential rows store the raw AES-GCM ciphertext + IV — the seal/open
+ * step lives in `crypto/aead.ts` and runs at the route or proxy layer,
+ * not here.
+ *
+ * Upstream row CRUD lives in `upstreams.ts`; the cached tool catalogue
+ * in `upstream-tools.ts`.
+ */
+
+import type { Env } from '../../env'
+import type { UpstreamServerRow } from './upstreams'
+
+// ----- user_credentials ----------------------------------------------------
+
+export interface UserCredentialRow {
+  user_id: string
+  upstream_id: string
+  kind: 'bearer' | 'oauth'
+  ciphertext: Uint8Array
+  iv: Uint8Array
+  key_version: number
+  created_at: number
+  updated_at: number
+}
+
+export async function getUserCredential(
+  env: Env,
+  userId: string,
+  upstreamId: string
+): Promise<UserCredentialRow | null> {
+  const row = await env.DB.prepare(
+    `SELECT user_id, upstream_id, kind, ciphertext, iv, key_version, created_at, updated_at
+     FROM user_credentials WHERE user_id = ?1 AND upstream_id = ?2`
+  )
+    .bind(userId, upstreamId)
+    .first<UserCredentialRow>()
+  if (!row) return null
+  // D1 returns BLOB columns as ArrayBuffer (or, on some compat dates,
+  // a plain number[]). SubtleCrypto's AES-GCM rejects both with
+  // "Incorrect type for the 'iv' field on 'EncryptAlgorithm': the
+  // provided value is not of type 'JsBufferSource'". Normalise once
+  // at the trust boundary so callers (aead.open) stay type-pure.
+  row.ciphertext = toUint8Array(row.ciphertext)
+  row.iv = toUint8Array(row.iv)
+  return row
+}
+
+function toUint8Array(v: unknown): Uint8Array {
+  if (v instanceof Uint8Array) return v
+  if (v instanceof ArrayBuffer) return new Uint8Array(v)
+  if (Array.isArray(v)) return new Uint8Array(v)
+  // Fallback for anything array-like (Buffer-shaped objects from
+  // older D1 paths). Throws if v is genuinely unrelated, which is
+  // the correct behaviour.
+  return new Uint8Array(v as ArrayLike<number>)
+}
+
+export interface UpsertCredentialInput {
+  kind: 'bearer' | 'oauth'
+  ciphertext: Uint8Array
+  iv: Uint8Array
+  keyVersion: number
+  /**
+   * True when these tokens come from an interactive authorization (OAuth
+   * code exchange) rather than a refresh — restamps `granted_at`, the clock
+   * the upstream's absolute grant lifetime runs from (migration 0036). A
+   * first insert always stamps it; a refresh must leave it alone.
+   */
+  newGrant?: boolean
+  /**
+   * Absolute expiry the PROVIDER reported for this authorization, unix
+   * seconds (migration 0039) — the authoritative source in
+   * `resolveGrantExpiry`. Null means "this response said nothing", which is
+   * not the same as "no expiry": a deadline reported once still stands, so
+   * the stored value survives. A NEW grant resets it, because the old
+   * deadline belonged to the authorization that was just replaced.
+   */
+  authExpiresAt?: number | null
+}
+
+export async function upsertUserCredential(
+  env: Env,
+  userId: string,
+  upstreamId: string,
+  input: UpsertCredentialInput
+): Promise<void> {
+  const now = Math.floor(Date.now() / 1000)
+  await env.DB.prepare(
+    `INSERT INTO user_credentials
+       (user_id, upstream_id, kind, ciphertext, iv, key_version, created_at, updated_at,
+        granted_at, auth_expires_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, ?9)
+     ON CONFLICT (user_id, upstream_id) DO UPDATE SET
+       kind = excluded.kind,
+       ciphertext = excluded.ciphertext,
+       iv = excluded.iv,
+       key_version = excluded.key_version,
+       updated_at = excluded.updated_at,
+       granted_at = CASE WHEN ?8 = 1 THEN excluded.updated_at ELSE user_credentials.granted_at END,
+       auth_expires_at = CASE
+         WHEN ?9 IS NOT NULL THEN ?9
+         WHEN ?8 = 1 THEN NULL
+         ELSE user_credentials.auth_expires_at
+       END`
+  )
+    .bind(
+      userId,
+      upstreamId,
+      input.kind,
+      input.ciphertext,
+      input.iv,
+      input.keyVersion,
+      now,
+      input.newGrant ? 1 : 0,
+      input.authExpiresAt ?? null
+    )
+    .run()
+}
+
+export async function deleteUserCredential(
+  env: Env,
+  userId: string,
+  upstreamId: string
+): Promise<void> {
+  await env.DB.prepare(`DELETE FROM user_credentials WHERE user_id = ?1 AND upstream_id = ?2`)
+    .bind(userId, upstreamId)
+    .run()
+}
+
+// ----- refresh lease + reauth flag ----------------------------------------
+
+/**
+ * Single-flight guard for user_oauth token refresh. Atomically claims a short
+ * lease on the (user, upstream) credential row via a conditional UPDATE — D1
+ * serializes writes, so exactly one concurrent caller wins. Returns true if
+ * THIS call won the lease (and must perform the refresh); false if another
+ * caller already holds it (and should wait for the rotated token rather than
+ * spending the refresh_token a second time, which would trip the provider's
+ * refresh-token-reuse revocation). The lease is an absolute unix-seconds
+ * deadline, so a crashed holder auto-releases after `ttlSeconds`. A row must
+ * already exist (an OAuth upstream always has stored tokens by refresh time);
+ * with no row the UPDATE matches nothing and this returns false.
+ */
+export async function acquireRefreshLease(
+  env: Env,
+  userId: string,
+  upstreamId: string,
+  ttlSeconds: number
+): Promise<boolean> {
+  const now = Math.floor(Date.now() / 1000)
+  const res = await env.DB.prepare(
+    `UPDATE user_credentials SET refresh_lock_until = ?3
+       WHERE user_id = ?1 AND upstream_id = ?2
+         AND (refresh_lock_until IS NULL OR refresh_lock_until < ?4)`
+  )
+    .bind(userId, upstreamId, now + ttlSeconds, now)
+    .run()
+  return (res.meta?.changes ?? 0) > 0
+}
+
+/**
+ * Presence + health of one (user, upstream) credential.
+ *  - `updatedAt` moves on every token save, so it doubles as a cheap
+ *    "has the stored credential changed?" stamp (a live MCP session compares
+ *    it to the value it bound its upstream client under).
+ *  - `grantedAt` is when the current grant was authorized — the clock an
+ *    upstream's absolute grant lifetime runs from (migration 0036).
+ * Both are null when no credential row exists.
+ */
+export interface CredentialStatus {
+  present: boolean
+  needsReauth: boolean
+  updatedAt: number | null
+  grantedAt: number | null
+  /** Provider-reported absolute expiry, unix seconds; null when unreported. */
+  authExpiresAt: number | null
+}
+
+export const NO_CREDENTIAL: CredentialStatus = {
+  present: false,
+  needsReauth: false,
+  updatedAt: null,
+  grantedAt: null,
+  authExpiresAt: null
+}
+
+interface CredentialStatusRow {
+  reauth_required_at: number | null
+  updated_at: number
+  granted_at: number | null
+  auth_expires_at: number | null
+}
+
+function toCredentialStatus(row: CredentialStatusRow): CredentialStatus {
+  return {
+    present: true,
+    needsReauth: row.reauth_required_at != null,
+    updatedAt: row.updated_at,
+    grantedAt: row.granted_at,
+    authExpiresAt: row.auth_expires_at
+  }
+}
+
+/**
+ * Batch variant of `getUserCredentialStatus`: presence + health for many
+ * upstreams in one read. Upstreams without a credential row are absent
+ * from the map — callers default to `NO_CREDENTIAL`.
+ */
+export async function getUserCredentialStatuses(
+  env: Env,
+  userId: string,
+  upstreamIds: string[]
+): Promise<Map<string, CredentialStatus>> {
+  const out = new Map<string, CredentialStatus>()
+  if (upstreamIds.length === 0) return out
+  const placeholders = upstreamIds.map((_, i) => `?${i + 2}`).join(', ')
+  const res = await env.DB.prepare(
+    `SELECT upstream_id, reauth_required_at, updated_at, granted_at, auth_expires_at
+     FROM user_credentials
+     WHERE user_id = ?1 AND upstream_id IN (${placeholders})`
+  )
+    .bind(userId, ...upstreamIds)
+    .all<CredentialStatusRow & { upstream_id: string }>()
+  for (const row of res.results ?? []) out.set(row.upstream_id, toCredentialStatus(row))
+  return out
+}
+
+/** Presence + health of a (user, upstream) credential, in one read. */
+export async function getUserCredentialStatus(
+  env: Env,
+  userId: string,
+  upstreamId: string
+): Promise<CredentialStatus> {
+  const row = await env.DB.prepare(
+    `SELECT reauth_required_at, updated_at, granted_at, auth_expires_at FROM user_credentials
+     WHERE user_id = ?1 AND upstream_id = ?2`
+  )
+    .bind(userId, upstreamId)
+    .first<CredentialStatusRow>()
+  return row ? toCredentialStatus(row) : NO_CREDENTIAL
+}
+
+/**
+ * Flag a credential as needing interactive re-auth after a definitive refresh
+ * failure. Conditional so it only fires on the clear→set transition — returns
+ * true when this call newly set the flag (so the caller audits once, not every
+ * failing session).
+ */
+export async function markReauthRequired(
+  env: Env,
+  userId: string,
+  upstreamId: string
+): Promise<boolean> {
+  const now = Math.floor(Date.now() / 1000)
+  const res = await env.DB.prepare(
+    `UPDATE user_credentials SET reauth_required_at = ?3
+       WHERE user_id = ?1 AND upstream_id = ?2 AND reauth_required_at IS NULL`
+  )
+    .bind(userId, upstreamId, now)
+    .run()
+  return (res.meta?.changes ?? 0) > 0
+}
+
+/** Clear the re-auth flag after a successful token save (refresh or reconnect). */
+export async function clearReauthRequired(
+  env: Env,
+  userId: string,
+  upstreamId: string
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE user_credentials SET reauth_required_at = NULL
+       WHERE user_id = ?1 AND upstream_id = ?2 AND reauth_required_at IS NOT NULL`
+  )
+    .bind(userId, upstreamId)
+    .run()
+}
+
+// ----- upstream_shared_credentials -----------------------------------------
+
+export interface SharedCredentialRow {
+  upstream_id: string
+  kind: 'bearer'
+  ciphertext: Uint8Array
+  iv: Uint8Array
+  key_version: number
+  created_by: string | null
+  created_at: number
+  updated_at: number
+}
+
+export async function getSharedCredential(
+  env: Env,
+  upstreamId: string
+): Promise<SharedCredentialRow | null> {
+  const row = await env.DB.prepare(
+    `SELECT upstream_id, kind, ciphertext, iv, key_version, created_by, created_at, updated_at
+     FROM upstream_shared_credentials WHERE upstream_id = ?1`
+  )
+    .bind(upstreamId)
+    .first<SharedCredentialRow>()
+  if (!row) return null
+  // Same D1-BLOB-shape normalisation as getUserCredential — see the
+  // long comment there.
+  row.ciphertext = toUint8Array(row.ciphertext)
+  row.iv = toUint8Array(row.iv)
+  return row
+}
+
+export async function hasSharedCredential(env: Env, upstreamId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS one FROM upstream_shared_credentials WHERE upstream_id = ?1`
+  )
+    .bind(upstreamId)
+    .first<{ one: number }>()
+  return row !== null
+}
+
+/** Batch variant of `hasSharedCredential`: which of these upstreams have one. */
+export async function sharedCredentialUpstreamIds(
+  env: Env,
+  upstreamIds: string[]
+): Promise<Set<string>> {
+  if (upstreamIds.length === 0) return new Set()
+  const placeholders = upstreamIds.map((_, i) => `?${i + 1}`).join(', ')
+  const res = await env.DB.prepare(
+    `SELECT upstream_id FROM upstream_shared_credentials WHERE upstream_id IN (${placeholders})`
+  )
+    .bind(...upstreamIds)
+    .all<{ upstream_id: string }>()
+  return new Set((res.results ?? []).map((r) => r.upstream_id))
+}
+
+export interface UpsertSharedCredentialInput {
+  kind: 'bearer'
+  ciphertext: Uint8Array
+  iv: Uint8Array
+  keyVersion: number
+  createdBy: string
+}
+
+export async function upsertSharedCredential(
+  env: Env,
+  upstreamId: string,
+  input: UpsertSharedCredentialInput
+): Promise<void> {
+  const now = Math.floor(Date.now() / 1000)
+  await env.DB.prepare(
+    `INSERT INTO upstream_shared_credentials
+       (upstream_id, kind, ciphertext, iv, key_version, created_by, created_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+     ON CONFLICT (upstream_id) DO UPDATE SET
+       kind = excluded.kind,
+       ciphertext = excluded.ciphertext,
+       iv = excluded.iv,
+       key_version = excluded.key_version,
+       created_by = excluded.created_by,
+       updated_at = excluded.updated_at`
+  )
+    .bind(
+      upstreamId,
+      input.kind,
+      input.ciphertext,
+      input.iv,
+      input.keyVersion,
+      input.createdBy,
+      now
+    )
+    .run()
+}
+
+export async function deleteSharedCredential(env: Env, upstreamId: string): Promise<void> {
+  await env.DB.prepare(`DELETE FROM upstream_shared_credentials WHERE upstream_id = ?1`)
+    .bind(upstreamId)
+    .run()
+}
+
+// ----- nightly keep-warm selection (upstream/keep-warm.ts) -----------------
+
+// Shared by the batch select and the backlog count so they can't disagree.
+// ?1 = now, ?2 = idle seconds.
+const KEEP_WARM_DUE = `
+     FROM user_credentials uc
+     JOIN upstream_servers us ON us.id = uc.upstream_id
+     WHERE uc.kind = 'oauth'
+       AND uc.reauth_required_at IS NULL
+       AND us.enabled = 1
+       AND uc.updated_at <= ?1 - ?2
+       AND COALESCE(uc.keep_warm_after, 0) <= ?1`
+
+export interface KeepWarmDue {
+  userId: string
+  upstream: UpstreamServerRow
+  /** The credential's `updated_at` at selection — compare after the attempt to tell a real refresh (tokens re-saved) from a no-op. */
+  credUpdatedAt: number
+}
+
+/**
+ * user_oauth credentials due for the nightly keep-warm: oauth-kind, not
+ * flagged for reauth, on an enabled upstream, untouched for at least
+ * `idleSeconds` (`updated_at` moves on every token save, so normal session
+ * traffic exempts active credentials), AND not attempted recently
+ * (`keep_warm_after`, migration 0037).
+ *
+ * Ordered least-recently-attempted first (never-attempted = 0), then
+ * oldest: every attempt stamps `keep_warm_after`, so an attempted
+ * credential moves to the BACK of the queue. Ordering by `updated_at`
+ * alone let credentials that can never re-save (no refresh token, or an
+ * access token that is still valid) hold the front of the batch every
+ * night. Capped at `limit` per run to bound refresh-token rotation spend.
+ */
+export async function listKeepWarmDueCredentials(
+  env: Env,
+  nowSec: number,
+  idleSeconds: number,
+  limit: number
+): Promise<KeepWarmDue[]> {
+  const res = await env.DB.prepare(
+    `SELECT uc.user_id AS cred_user_id, uc.updated_at AS cred_updated_at, us.*
+     ${KEEP_WARM_DUE}
+     ORDER BY COALESCE(uc.keep_warm_after, 0) ASC, uc.updated_at ASC
+     LIMIT ?3`
+  )
+    .bind(nowSec, idleSeconds, limit)
+    .all<UpstreamServerRow & { cred_user_id: string; cred_updated_at: number }>()
+  return (res.results ?? []).map(({ cred_user_id, cred_updated_at, ...upstream }) => ({
+    userId: cred_user_id,
+    credUpdatedAt: cred_updated_at,
+    upstream: upstream as UpstreamServerRow
+  }))
+}
+
+/** How many credentials are due in total — the run reports what it could not reach. */
+export async function countKeepWarmDueCredentials(
+  env: Env,
+  nowSec: number,
+  idleSeconds: number
+): Promise<number> {
+  const row = await env.DB.prepare(`SELECT COUNT(*) AS n ${KEEP_WARM_DUE}`)
+    .bind(nowSec, idleSeconds)
+    .first<{ n: number }>()
+  return row?.n ?? 0
+}
+
+/** Stamp the earliest time keep-warm may look at this credential again. */
+export async function setKeepWarmAfter(
+  env: Env,
+  userId: string,
+  upstreamId: string,
+  notBefore: number
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE user_credentials SET keep_warm_after = ?3 WHERE user_id = ?1 AND upstream_id = ?2`
+  )
+    .bind(userId, upstreamId, notBefore)
+    .run()
+}

@@ -1,0 +1,73 @@
+/**
+ * Revoke every OAuth grant a user holds — all their MCP + CLI bearer/refresh
+ * tokens at once. Used on suspend/delete for *instant* MCP cutoff.
+ *
+ * The provider's token format is `{userId}:{grantId}:{secret}`, so revoking a
+ * grant invalidates every token minted under it: the next authenticated MCP
+ * request (a tool-call POST, an SSE message, or a token refresh) 401s and the
+ * agent's session ends. This complements the two existing gates:
+ *   - per-request SPA status re-check (auth/middleware.ts) — cuts the cookie,
+ *   - McpSessionDO.init() lifecycle gate — blocks a fresh reconnect,
+ * closing the one remaining window: an already-open MCP session whose bearer
+ * was still valid.
+ *
+ * Best-effort: a partial/total KV failure is swallowed (logged) and reported
+ * via `complete:false`, because the status change is the authoritative lockout
+ * and the two gates above still hold. Returns the number of grants revoked.
+ */
+
+import { getOAuthApi } from '@cloudflare/workers-oauth-provider'
+import type { Env } from '../env'
+import { deleteGrantActivityForUser } from '../db/queries/oauth-grant-activity'
+import { errMessage } from '../util/errors'
+
+export async function revokeAllUserGrants(
+  env: Env,
+  userId: string
+): Promise<{ revoked: number; complete: boolean }> {
+  // Handler-time import: provider-config reaches mcp/session-do → agents
+  // SDK → `cloudflare:email`, which the vitest workerd runtime can't load
+  // at module scope; the composed app (src/app.ts) imports this module via
+  // admin-users.ts and must stay importable by the integration suite.
+  const { oauthProviderOptions } = await import('./provider-config')
+  const helpers = getOAuthApi<Env>(oauthProviderOptions(), env)
+  let revoked = 0
+  let complete = true
+  try {
+    let cursor: string | undefined
+    do {
+      const page = await helpers.listUserGrants(userId, { limit: 100, cursor })
+      for (const g of page.items) {
+        try {
+          await helpers.revokeGrant(g.id, userId)
+          revoked++
+        } catch (err) {
+          complete = false
+          console.warn(
+            `[revoke-grants] revokeGrant(${g.id}) failed:`,
+            errMessage(err)
+          )
+        }
+      }
+      cursor = page.cursor ?? undefined
+    } while (cursor)
+  } catch (err) {
+    complete = false
+    console.warn(
+      `[revoke-grants] listUserGrants(${userId}) failed:`,
+      errMessage(err)
+    )
+  }
+  // Drop the login-activity rows for those grants now rather than waiting for
+  // the nightly sweep to notice they are gone. Best-effort like the rest of
+  // this function: the ledger is bookkeeping, the revocation is the lockout.
+  try {
+    await deleteGrantActivityForUser(env, userId)
+  } catch (err) {
+    console.warn(
+      `[revoke-grants] clearing login activity for ${userId} failed:`,
+      errMessage(err)
+    )
+  }
+  return { revoked, complete }
+}

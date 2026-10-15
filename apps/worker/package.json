@@ -1,0 +1,41 @@
+{
+  "name": "@ctxlayer/worker",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "predev": "bun ../../scripts/setup-dev-tls.mjs && bun ../../scripts/ensure-dist.mjs && wrangler d1 migrations apply DB --local",
+    "dev": "wrangler dev --https-key-path ../../.dev-tls/localhost-key.pem --https-cert-path ../../.dev-tls/localhost.pem",
+    "prebuild": "bun ../../scripts/ensure-dist.mjs",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "predeploy": "bun --filter='@ctxlayer/web' run build && bun ../../scripts/ensure-dist.mjs",
+    "deploy": "bun ../../scripts/deploy.mjs",
+    "predeploy:preview": "bun --filter='@ctxlayer/web' run build && bun ../../scripts/ensure-dist.mjs",
+    "deploy:preview": "bun ../../scripts/deploy.mjs --preview",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'covered by root biome lint'",
+    "test": "vitest run",
+    "test:int": "vitest run --config vitest.integration.config.ts"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.10.3",
+    "@ctxlayer/shared": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "agents": "^0.20.1",
+    "fflate": "^0.8.2",
+    "hono": "^4.6.0",
+    "js-tiktoken": "^1.0.21",
+    "lib0": "^0.2.117",
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.30",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "@cloudflare/vitest-pool-workers": "^0.21.0",
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.0.0"
+  }
+}

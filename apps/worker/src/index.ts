@@ -1,0 +1,314 @@
+import { OAuthProvider, getOAuthApi } from '@cloudflare/workers-oauth-provider'
+import type { Env } from './env'
+import { queueKind } from './queues/route'
+import { app } from './app'
+import { oauthProviderOptions } from './oauth/provider-config'
+import { usageConsumer } from './queues/usage-consumer'
+import { reindexConsumer } from './queues/reindex-consumer'
+import { gitSyncConsumer } from './queues/git-sync-consumer'
+import { jobsConsumer } from './queues/jobs-consumer'
+import { pruneUsageEvents } from './db/queries/usage'
+import { clearAsyncJobResults, pruneAsyncJobs } from './db/queries/async-jobs'
+import { pruneOrphanOAuthClients } from './oauth/prune-clients'
+import { sweepIdleGrants } from './oauth/grant-sweep'
+import { MCP_LOGIN_IDLE_DAYS } from './oauth/login-activity'
+import { listDueGitSyncs } from './git/sync'
+import { audit } from './audit/log'
+import { notify } from './ops/alert'
+import { LAST_CRON_KV_KEY } from './ops/cron-heartbeat'
+import { withHsts } from './util/security-headers'
+import { isMcpPathOnWrongHost } from './util/mcp-host'
+import { errMessage } from './util/errors'
+import { keepWarmUserCredentials } from './upstream/keep-warm'
+import { recordJobRun } from './ops/job-runs'
+import { pruneJobRuns } from './db/queries/job-runs'
+
+export { McpSessionDO } from './mcp/session-do'
+export { DocRoomDO } from './collab/doc-room-do'
+
+// Route mounting lives in `app.ts` — this module only wraps the composed
+// Hono app in the OAuthProvider and the worker handler (HSTS + queue +
+// scheduled).
+
+// OAuthProvider wraps the worker's fetch. It implements /oauth/token,
+// /oauth/register, /.well-known/oauth-authorization-server, and gates
+// /mcp + /sse on a valid bearer token. Everything else falls through
+// to the Hono app (default handler). Provider options live in
+// `oauth/provider-config.ts` so admin tooling can construct a
+// read-only `OAuthHelpers` against the identical config.
+// Built per request rather than at module scope because the options now
+// carry a `tokenExchangeCallback` that writes the login-activity ledger, and
+// that callback needs `env` — which only exists per invocation. The
+// constructor just validates options and builds a capabilities object (all
+// real state is in KV), so this is not a per-request cost worth avoiding.
+const buildOAuthProvider = (env: Env) =>
+  new OAuthProvider<Env>(
+    oauthProviderOptions({ fetch: app.fetch as ExportedHandler<Env>['fetch'] }, env)
+  )
+
+const worker: ExportedHandler<Env> = {
+  // HSTS on every worker-served response (asset responses get it from
+  // dist/_headers — see util/security-headers.ts). Skipped on localhost so
+  // dev doesn't pin the browser's whole `localhost` to HTTPS.
+  fetch: async (req, env, ctx) => {
+    // Host-scope the machine MCP surface: when a dedicated MCP host is
+    // configured, the browser host 404s /mcp,/sse,/cli instead of answering
+    // with a confusing `invalid_token` (a past-Access user has no MCP bearer).
+    // No-op for single-host deployments. See util/mcp-host.ts.
+    if (isMcpPathOnWrongHost(req, env)) {
+      return withHsts(req, Response.json({ error: 'not_found' }, { status: 404 }))
+    }
+    return withHsts(req, await buildOAuthProvider(env).fetch(req, env, ctx))
+  },
+  async queue(batch, env, ctx) {
+    // Match on the type SUFFIX, not an exact name: queue names are
+    // deployment-specific (tenants prefix them with the worker name, e.g.
+    // `ctxlayer-acme-usage`). See queues/route.ts. Matching exact base
+    // names silently broke usage/reindex/git-sync on every tenant.
+    switch (queueKind(batch.queue)) {
+      case 'usage':
+        return usageConsumer(batch, env, ctx)
+      case 'reindex':
+        return reindexConsumer(batch, env, ctx)
+      case 'git-sync':
+        return gitSyncConsumer(batch, env, ctx)
+      case 'jobs':
+        return jobsConsumer(batch, env, ctx)
+    }
+    // A configured consumer with no code branch = deploy/config skew. Retry
+    // (bounded by max_retries in wrangler.toml) rather than silently drop, and
+    // alert so it's not invisible.
+    console.error(`unknown queue: ${batch.queue}`)
+    await notify(env, { level: 'error', event: 'queue.unknown', detail: String(batch.queue) })
+    for (const msg of batch.messages) msg.retry()
+  },
+  async scheduled(controller, env, ctx) {
+    // Liveness heartbeat for /api/health — any cron firing refreshes it, so a
+    // stalled scheduler becomes visible (it otherwise emits nothing at all).
+    ctx.waitUntil(
+      env.OAUTH_KV.put(
+        LAST_CRON_KV_KEY,
+        String(Math.floor(controller.scheduledTime / 1000))
+      ).catch((e) => console.error('[cron] heartbeat write failed', e))
+    )
+    // Hourly cron (`0 * * * *`): git-sync due-check. Enqueue one message per
+    // enabled source whose sync_interval has elapsed AND that has an
+    // unattended credential path: shared_bearer, or a user_* read strategy
+    // with a self-designated sync identity (the message carries that userId
+    // so the consumer resolves their stored token). See listDueGitSyncs.
+    if (controller.cron === '0 * * * *') {
+      ctx.waitUntil(
+        (async () => {
+          try {
+            await recordJobRun(env, 'git-sync-due', async () => {
+              const nowSec = Math.floor(controller.scheduledTime / 1000)
+              const { due, total } = await listDueGitSyncs(env, nowSec)
+              for (const d of due) {
+                await env.GIT_SYNC_QUEUE.send(
+                  d.userId ? { sourceId: d.sourceId, userId: d.userId } : { sourceId: d.sourceId }
+                )
+              }
+              console.log(`[cron] git-sync: queued ${due.length}/${total} source(s)`)
+              return { summary: { queued: due.length, total } }
+            })
+          } catch (err) {
+            const m = errMessage(err)
+            console.error(`[cron] git-sync due-check failed: ${m}`)
+            await notify(env, { level: 'error', event: 'cron.git_sync_failed', detail: m })
+          }
+        })()
+      )
+      return
+    }
+
+    // Nightly cron (`0 3 * * *`). Each task is independent and wrapped
+    // in its own try/catch + waitUntil so a slow/failed one can't time
+    // out the trigger or starve the others.
+
+    // 1. Prune raw usage_events older than 30 days (rollups stay forever).
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await recordJobRun(env, 'usage-prune', async () => {
+            const removed = await pruneUsageEvents(env, 30)
+            console.log(`[cron] pruned ${removed} usage_events rows older than 30d`)
+            return { summary: { removed } }
+          })
+        } catch (err) {
+          const m = errMessage(err)
+          console.error(`[cron] usage_events prune failed: ${m}`)
+          await notify(env, { level: 'error', event: 'cron.usage_prune_failed', detail: m })
+        }
+      })()
+    )
+
+    // 1b. async_jobs two-tier retention: drop the heavy result_json blob after
+    // 1 day (retry-warm is 15 min; polling is a live action), but keep the
+    // lightweight row for 30 days so the admin async-usage panel matches the
+    // usage_events retention window, then delete.
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await recordJobRun(env, 'async-retention', async () => {
+            const cleared = await clearAsyncJobResults(env, 24 * 60 * 60)
+            const removed = await pruneAsyncJobs(env, 30 * 24 * 60 * 60)
+            console.log(
+              `[cron] async_jobs: cleared ${cleared} result blobs (>1d), pruned ${removed} rows (>30d)`
+            )
+            return { summary: { cleared, removed } }
+          })
+        } catch (err) {
+          const m = errMessage(err)
+          console.error(`[cron] async_jobs prune failed: ${m}`)
+          await notify(env, { level: 'error', event: 'cron.async_jobs_prune_failed', detail: m })
+        }
+      })()
+    )
+
+    // 2. Prune abandoned DCR client registrations: public, zero-grant,
+    // older than 1 day (the loopback-OAuth retry detritus). Fail-closed
+    // if the grant index is incomplete — see oauth/prune-clients.ts.
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await recordJobRun(env, 'oauth-client-prune', async () => {
+            const helpers = getOAuthApi<Env>(oauthProviderOptions(), env)
+            const r = await pruneOrphanOAuthClients(env, helpers, { olderThanDays: 1 })
+            if (r.skippedIncompleteIndex) {
+              console.warn('[cron] oauth-client prune skipped: grant index incomplete')
+              return { status: 'partial' as const, summary: { skipped: 'incomplete_grant_index' } }
+            }
+            console.log(
+              `[cron] pruned ${r.deleted}/${r.orphans} orphan oauth clients ` +
+                `(scanned ${r.scanned}, ${r.failed} delete failures)`
+            )
+            // Same summary row the admin-initiated prune writes;
+            // audit_log.actor_id is un-FK'd TEXT, so the sentinel is safe.
+            if (r.deleted > 0) {
+              await audit(env, {
+                actorId: 'cron',
+                action: 'oauth_client.prune',
+                meta: {
+                  scanned: r.scanned,
+                  orphans: r.orphans,
+                  deleted: r.deleted,
+                  failed: r.failed,
+                  deletedIds: r.deletedIds
+                }
+              })
+            }
+            return {
+              status: r.failed > 0 ? ('partial' as const) : ('ok' as const),
+              summary: { scanned: r.scanned, orphans: r.orphans, deleted: r.deleted, failed: r.failed }
+            }
+          })
+        } catch (err) {
+          const m = errMessage(err)
+          console.error(`[cron] oauth-client prune failed: ${m}`)
+          await notify(env, { level: 'error', event: 'cron.oauth_prune_failed', detail: m })
+        }
+      })()
+    )
+
+    // 3. Keep-warm long-idle user_oauth refresh tokens so provider
+    // inactivity windows don't silently kill them; un-preventable deaths
+    // (scope change, revocation) surface as next-morning needsReauth
+    // flags instead of mid-task surprises. Cadence + batch are the
+    // rotation-spend safety knobs — see upstream/keep-warm.ts.
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await recordJobRun(env, 'keep-warm', async () => {
+            const nowSec = Math.floor(controller.scheduledTime / 1000)
+            const r = await keepWarmUserCredentials(env, nowSec)
+            if (r.due > 0) {
+              console.log(
+                `[cron] keep-warm: ${r.due} attempted — ${r.refreshed} refreshed, ` +
+                  `${r.flagged} flagged for reauth, ${r.idle} nothing to do, ${r.failed} failed` +
+                  (r.backlog > 0 ? `; ${r.backlog} due but not reached` : '')
+              )
+            }
+            // Only a transient failure makes the run partial. A flagged
+            // credential is a death DETECTED — the job doing its job.
+            return { status: r.failed > 0 ? ('partial' as const) : ('ok' as const), summary: r }
+          })
+        } catch (err) {
+          const m = errMessage(err)
+          console.error(`[cron] keep-warm failed: ${m}`)
+          await notify(env, { level: 'error', event: 'cron.keep_warm_failed', detail: m })
+        }
+      })()
+    )
+
+    // 4. Expire MCP logins that went quiet. Grants and DCR client records
+    // carry no KV expiration any more (oauth/provider-config.ts), so a login
+    // lives as long as its client keeps refreshing — this is the other half:
+    // revoke the ones silent for MCP_LOGIN_IDLE_DAYS, and keep the activity
+    // ledger in step with KV. Fail-closed on an incomplete grant read.
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await recordJobRun(env, 'grant-idle-prune', async () => {
+            const helpers = getOAuthApi<Env>(oauthProviderOptions(), env)
+            const nowSec = Math.floor(controller.scheduledTime / 1000)
+            const r = await sweepIdleGrants(env, helpers, {
+              idleDays: MCP_LOGIN_IDLE_DAYS,
+              now: nowSec
+            })
+            if (r.skippedIncompleteIndex) {
+              console.warn('[cron] grant-idle-prune skipped: grant read incomplete')
+              return { status: 'partial' as const, summary: { skipped: 'incomplete_grant_index' } }
+            }
+            if (r.revoked > 0 || r.seeded > 0 || r.pruned > 0) {
+              console.log(
+                `[cron] grant-idle-prune: ${r.grants} grants, ${r.tracked} tracked — ` +
+                  `${r.seeded} seeded, ${r.revoked} revoked as idle (>${MCP_LOGIN_IDLE_DAYS}d), ` +
+                  `${r.pruned} stale rows dropped, ${r.failed} revoke failures`
+              )
+            }
+            // An idle revocation is a policy decision about someone's
+            // access — audited like the admin-initiated ones.
+            if (r.revoked > 0) {
+              await audit(env, {
+                actorId: 'cron',
+                action: 'oauth_grant.idle_revoke',
+                meta: { revoked: r.revoked, idleDays: MCP_LOGIN_IDLE_DAYS, failed: r.failed }
+              })
+            }
+            return {
+              status: r.failed > 0 ? ('partial' as const) : ('ok' as const),
+              summary: {
+                grants: r.grants,
+                tracked: r.tracked,
+                seeded: r.seeded,
+                revoked: r.revoked,
+                pruned: r.pruned,
+                failed: r.failed
+              }
+            }
+          })
+        } catch (err) {
+          const m = errMessage(err)
+          console.error(`[cron] grant-idle-prune failed: ${m}`)
+          await notify(env, { level: 'error', event: 'cron.grant_idle_prune_failed', detail: m })
+        }
+      })()
+    )
+
+    // 5. Prune the job-runs ledger itself (90d) — recorded like any task.
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await recordJobRun(env, 'jobs-prune', async () => {
+            const removed = await pruneJobRuns(env, 90 * 24 * 60 * 60)
+            return { summary: { removed } }
+          })
+        } catch (err) {
+          console.error(`[cron] job-runs prune failed: ${errMessage(err)}`)
+        }
+      })()
+    )
+  }
+}
+
+export default worker

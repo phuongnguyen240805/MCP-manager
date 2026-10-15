@@ -1,0 +1,320 @@
+/**
+ * D1 queries for `skills` + `skill_revisions`. Mirrors `docs.ts` in
+ * shape but with skills-specific differences:
+ *   - no folder / lock / per-skill ACL (open-read for any signed-in
+ *     user, admin-write only)
+ *   - status gate: drafts + archived are admin-only on read paths
+ *   - no chunk count (skills aren't indexed into Vectorize in v1)
+ *
+ * The single MCP layer reads via `listSkillsForReader` /
+ * `getSkillBySlug` which already apply the status filter for non-admin
+ * callers; SPA admin routes use `listSkillsForAdmin` to see drafts.
+ */
+
+import type { Env } from '../../env'
+import { suggestSlug } from '@ctxlayer/shared'
+import type { RevisionKind } from '../revision-policy'
+import { buildPatchUpdate, isUniqueViolation, newId, randomSuffix } from './util'
+import { makeRevisionQueries } from './revision-queries'
+
+export interface SkillRow {
+  id: string
+  slug: string
+  title: string
+  description: string
+  trigger_text: string
+  status: 'draft' | 'published' | 'archived'
+  visibility: 'private' | 'org'
+  current_rev_id: string | null
+  drafter_meta: string | null
+  created_by: string | null
+  created_at: number
+  updated_at: number
+  deleted_at: number | null
+}
+
+export interface SkillWithUsersRow extends SkillRow {
+  created_by_email: string | null
+  created_by_name: string | null
+  updated_by_id: string | null
+  updated_by_email: string | null
+  updated_by_name: string | null
+  // M8: 1 if any attached tool's input_schema_hash changed after this
+  // skill's updated_at. 0 otherwise. Computed at read time via EXISTS
+  // subquery; no persisted column needed.
+  is_stale: number
+}
+
+const SELECT_SKILL_WITH_USERS = `
+  SELECT s.id, s.slug, s.title, s.description, s.trigger_text, s.status,
+         s.visibility, s.current_rev_id, s.drafter_meta, s.created_by,
+         s.created_at, s.updated_at, s.deleted_at,
+         cu.email AS created_by_email,
+         cu.name  AS created_by_name,
+         ru.id    AS updated_by_id,
+         ru.email AS updated_by_email,
+         ru.name  AS updated_by_name,
+         (
+           SELECT 1 FROM skill_attachments sa
+           JOIN upstream_tools ut
+             ON ut.upstream_id = sa.upstream_id
+            AND ut.tool_name   = sa.tool_name
+           WHERE sa.skill_id = s.id
+             AND sa.tool_name != ''
+             AND ut.last_schema_change_at IS NOT NULL
+             AND ut.last_schema_change_at > s.updated_at
+           LIMIT 1
+         ) AS is_stale
+  FROM skills s
+  LEFT JOIN users cu ON cu.id = s.created_by
+  LEFT JOIN skill_revisions r ON r.id = s.current_rev_id
+  LEFT JOIN users ru ON ru.id = r.author_id`
+
+export interface SkillRevisionRow {
+  id: string
+  skill_id: string
+  author_id: string | null
+  r2_key: string
+  byte_size: number
+  content_hash: string
+  created_at: number
+  kind: RevisionKind
+}
+
+/**
+ * Reader-facing list: org-shared published skills only, ordered by
+ * updated_at DESC. Backs MCP `list_skills` and the CLI `pull` export.
+ * A private skill (visibility='private') is never surfaced here even
+ * when published — it stays scoped to its owner (see
+ * `listSkillsVisibleToUser`).
+ */
+export async function listPublishedSkills(env: Env): Promise<SkillWithUsersRow[]> {
+  const res = await env.DB.prepare(
+    `${SELECT_SKILL_WITH_USERS}
+     WHERE s.deleted_at IS NULL AND s.status = 'published' AND s.visibility = 'org'
+     ORDER BY s.updated_at DESC`
+  ).all<SkillWithUsersRow>()
+  return res.results ?? []
+}
+
+/**
+ * Caller-scoped list for the non-admin SPA `/app/skills`: every
+ * org-shared published skill PLUS all of the caller's own skills (any
+ * status/visibility), so an owner sees their private drafts alongside
+ * the shared library. Admins use `listSkillsForAdmin` (sees everything).
+ */
+export async function listSkillsVisibleToUser(
+  env: Env,
+  userId: string
+): Promise<SkillWithUsersRow[]> {
+  const res = await env.DB.prepare(
+    `${SELECT_SKILL_WITH_USERS}
+     WHERE s.deleted_at IS NULL
+       AND ( (s.status = 'published' AND s.visibility = 'org') OR s.created_by = ?1 )
+     ORDER BY s.updated_at DESC`
+  )
+    .bind(userId)
+    .all<SkillWithUsersRow>()
+  return res.results ?? []
+}
+
+/**
+ * Admin-facing list. Defaults to draft + published (excludes archived
+ * unless explicitly requested). Used by /app/admin/skills.
+ */
+export async function listSkillsForAdmin(
+  env: Env,
+  opts: { status?: 'draft' | 'published' | 'archived' | 'all' } = {}
+): Promise<SkillWithUsersRow[]> {
+  const status = opts.status
+  let where = `s.deleted_at IS NULL`
+  if (status === 'draft') where += ` AND s.status = 'draft'`
+  else if (status === 'published') where += ` AND s.status = 'published'`
+  else if (status === 'archived') where += ` AND s.status = 'archived'`
+  else if (status === 'all') {
+    /* no extra filter */
+  } else {
+    // Default (status omitted): the active set — draft + published.
+    where += ` AND s.status IN ('draft', 'published')`
+  }
+  const res = await env.DB.prepare(
+    `${SELECT_SKILL_WITH_USERS} WHERE ${where} ORDER BY s.updated_at DESC`
+  ).all<SkillWithUsersRow>()
+  return res.results ?? []
+}
+
+export async function getSkillById(env: Env, id: string): Promise<SkillWithUsersRow | null> {
+  const row = await env.DB.prepare(
+    `${SELECT_SKILL_WITH_USERS} WHERE s.id = ?1 AND s.deleted_at IS NULL`
+  )
+    .bind(id)
+    .first<SkillWithUsersRow>()
+  return row ?? null
+}
+
+export async function getSkillBySlug(env: Env, slug: string): Promise<SkillWithUsersRow | null> {
+  const row = await env.DB.prepare(
+    `${SELECT_SKILL_WITH_USERS} WHERE s.slug = ?1 AND s.deleted_at IS NULL`
+  )
+    .bind(slug)
+    .first<SkillWithUsersRow>()
+  return row ?? null
+}
+
+export interface CreateSkillInput {
+  slug?: string
+  title: string
+  description: string
+  triggerText?: string
+  status?: 'draft' | 'published' | 'archived'
+  // Defaults to 'org' when omitted (preserves pre-visibility behavior for
+  // admin/CLI create paths). The non-admin REST create passes 'private'.
+  visibility?: 'private' | 'org'
+  drafterMeta?: unknown
+  createdBy: string
+}
+
+/**
+ * Create a new skill. Slug collision retry mirrors createDoc — slugify
+ * the title if no slug supplied, append a random suffix on UNIQUE
+ * violation (up to 3 retries). Status defaults to 'draft'.
+ *
+ * `drafterMeta` is an opaque JSON value persisted alongside the row;
+ * used by the CLI `draft-skill` command to record model + version +
+ * context inputs. Null/undefined for manually-authored skills.
+ */
+export async function createSkill(env: Env, input: CreateSkillInput): Promise<SkillRow> {
+  const id = newId()
+  const now = Math.floor(Date.now() / 1000)
+  const baseSlug = input.slug ?? suggestSlug('skill', input.title)
+  const status = input.status ?? 'draft'
+  const visibility = input.visibility ?? 'org'
+  const triggerText = input.triggerText ?? ''
+  const drafterMetaJson =
+    input.drafterMeta !== undefined && input.drafterMeta !== null
+      ? JSON.stringify(input.drafterMeta)
+      : null
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const slug = attempt === 0 ? baseSlug : `${baseSlug}-${randomSuffix()}`
+    try {
+      await env.DB.prepare(
+        `INSERT INTO skills
+           (id, slug, title, description, trigger_text, status, visibility, drafter_meta,
+            created_by, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)`
+      )
+        .bind(
+          id,
+          slug,
+          input.title,
+          input.description,
+          triggerText,
+          status,
+          visibility,
+          drafterMetaJson,
+          input.createdBy,
+          now
+        )
+        .run()
+      const row = await env.DB.prepare(
+        `SELECT id, slug, title, description, trigger_text, status, visibility,
+                current_rev_id, drafter_meta, created_by,
+                created_at, updated_at, deleted_at
+         FROM skills WHERE id = ?1`
+      )
+        .bind(id)
+        .first<SkillRow>()
+      if (!row) throw new Error('skill_insert_lost')
+      return row
+    } catch (err) {
+      if (isUniqueViolation(err) && attempt < 3) continue
+      throw err
+    }
+  }
+  throw new Error('skill_slug_collision_persistent')
+}
+
+export interface PatchSkillInput {
+  // slug intentionally omitted: skill slugs are immutable after creation
+  // (public MCP id + on-disk SKILL.md path).
+  title?: string
+  description?: string
+  triggerText?: string
+  status?: 'draft' | 'published' | 'archived'
+  visibility?: 'private' | 'org'
+}
+
+export async function patchSkill(env: Env, id: string, patch: PatchSkillInput): Promise<void> {
+  const update = buildPatchUpdate(
+    'skills',
+    {
+      title: patch.title,
+      description: patch.description,
+      trigger_text: patch.triggerText,
+      status: patch.status,
+      visibility: patch.visibility
+    },
+    id,
+    { andWhere: 'deleted_at IS NULL' }
+  )
+  if (!update) return
+  await env.DB.prepare(update.sql)
+    .bind(...update.binds)
+    .run()
+}
+
+export async function softDeleteSkill(env: Env, id: string): Promise<void> {
+  const now = Math.floor(Date.now() / 1000)
+  await env.DB.prepare(`UPDATE skills SET deleted_at = ?1 WHERE id = ?2`).bind(now, id).run()
+}
+
+export interface RecordSkillRevisionInput {
+  skillId: string
+  revisionId: string
+  authorId: string
+  r2Key: string
+  byteSize: number
+  contentHash: string
+  // Defaults to 'explicit'. See db/revision-policy.ts.
+  kind?: RevisionKind
+}
+
+// The skill-side instantiation of the shared revision machinery — see
+// revision-queries.ts for the semantics. skill_revisions mirrors
+// doc_revisions by design (0011). Exported for the shared save pipeline
+// (api/revision-save.ts); routes use the named delegates.
+export const skillRevisionQueries = makeRevisionQueries<SkillRevisionRow>({
+  parentTable: 'skills',
+  revisionTable: 'skill_revisions',
+  fkColumn: 'skill_id',
+  insertLostError: 'skill_revision_insert_lost'
+})
+
+export function recordSkillRevision(
+  env: Env,
+  input: RecordSkillRevisionInput
+): Promise<SkillRevisionRow> {
+  return skillRevisionQueries.record(env, {
+    parentId: input.skillId,
+    revisionId: input.revisionId,
+    authorId: input.authorId,
+    r2Key: input.r2Key,
+    byteSize: input.byteSize,
+    contentHash: input.contentHash,
+    kind: input.kind
+  })
+}
+
+export function listSkillRevisions(env: Env, skillId: string): Promise<SkillRevisionRow[]> {
+  return skillRevisionQueries.list(env, skillId)
+}
+
+export function getSkillRevision(
+  env: Env,
+  skillId: string,
+  revisionId: string
+): Promise<SkillRevisionRow | null> {
+  return skillRevisionQueries.get(env, skillId, revisionId)
+}
+

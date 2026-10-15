@@ -1,0 +1,423 @@
+/**
+ * Admin REST for `upstream_servers`, `upstream_visibility`, and the
+ * cached `upstream_tools` catalogue.
+ *
+ * Only remote HTTP transports are dialable — `SupportedTransport`
+ * narrows the request enum to streamable_http|sse, and
+ * we double-check before writing to D1 so a forged payload can't
+ * sneak an unsupported transport into the CHECK constraint.
+ */
+
+import { Hono, type Context } from 'hono'
+import {
+  CreateUpstreamRequest,
+  PasteBearerRequest,
+  ReplaceToolAccessRequest,
+  ReplaceVisibilityRequest,
+  UpdateUpstreamRequest,
+  isSameOrigin,
+  type RefreshToolsResponse,
+  type ToolAccessEntry,
+  type ToolAccessRule,
+  type UpstreamToolAccessResponse
+} from '@ctxlayer/shared'
+import type { Env } from '../env'
+import { requireAdmin, type AuthedVariables } from '../auth/middleware'
+import { requireCsrf } from '../auth/csrf'
+import {
+  adminRowFor,
+  createUpstream,
+  deleteUpstream,
+  getUpstreamForAdmin,
+  listUpstreamsForAdmin,
+  parseAuthConfig,
+  patchUpstream,
+  replaceVisibility,
+  shareUpstreamWithOrg,
+  toUpstreamConnection
+} from '../db/queries/upstreams'
+import { listCachedTools } from '../db/queries/upstream-tools'
+import {
+  deleteSharedCredential,
+  upsertSharedCredential
+} from '../db/queries/upstream-credentials'
+import { refreshCatalogueForConnection, warmCatalogueAndLog } from '../upstream/catalogue'
+import { resolveUserUpstreamBearer } from '../upstream/bearer'
+import {
+  clampTimeouts,
+  dropLegacyDcrMirror,
+  oauthEndpointSelfLoop,
+  prepareOAuthSecret,
+  preserveDcrClient
+} from '../upstream/admin-config'
+import { seal } from '../crypto/aead'
+import { audit } from '../audit/log'
+import { listToolAccessForUpstream, replaceToolAccessForTool } from '../db/queries/tool-access'
+import { buildUpstreamToolsPayload } from './upstreams-attachments'
+import { notFound, parseJsonBody } from './respond'
+import { isUniqueViolation } from '../db/queries/util'
+
+export const adminUpstreamsRoute = new Hono<{ Bindings: Env; Variables: AuthedVariables }>()
+adminUpstreamsRoute.use('*', requireAdmin)
+adminUpstreamsRoute.use('*', requireCsrf)
+
+// Refusal for org-scoping writes (grants, per-tool ACL) on a private
+// upstream: its owner is its whole audience, so a rule could only widen it.
+// "Share with org" first.
+const privateUpstream = (c: Context) =>
+  c.json(
+    { error: 'private_upstream', message: 'Private upstream — share it with the org first' },
+    409
+  )
+
+adminUpstreamsRoute.get('/', async (c) => {
+  const userId = c.get('user').userId
+  const rows = await listUpstreamsForAdmin(c.env, userId)
+  const hydrated = await Promise.all(rows.map((r) => adminRowFor(c.env, r.id, userId)))
+  return c.json(hydrated.filter((x) => x !== null))
+})
+
+adminUpstreamsRoute.get('/:id', async (c) => {
+  const userId = c.get('user').userId
+  const row = await adminRowFor(c.env, c.req.param('id'), userId)
+  if (!row) return notFound(c)
+  return c.json(row)
+})
+
+adminUpstreamsRoute.post('/', async (c) => {
+  const parsed = await parseJsonBody(c, CreateUpstreamRequest)
+  if (!parsed.ok) return parsed.res
+  const input = parsed.data
+  // Self-loop guard: an upstream must not point back at this ctxlayer
+  // deployment (host+port match against PUBLIC_BASE_URL), or the proxy
+  // would call into itself. Enforced here, not in the shared schema,
+  // which can't see env.
+  if (isSameOrigin(input.url, c.env.PUBLIC_BASE_URL)) {
+    return c.json({ error: 'self_loop', message: 'URL must not point at this ctxlayer instance' }, 400)
+  }
+  if (oauthEndpointSelfLoop(input.authConfig, c.env)) {
+    return c.json(
+      { error: 'self_loop', message: 'OAuth endpoints must not point at this ctxlayer instance' },
+      400
+    )
+  }
+  try {
+    const row = await createUpstream(c.env, {
+      slug: input.slug,
+      displayName: input.displayName,
+      transport: input.transport,
+      url: input.url,
+      authStrategy: input.authStrategy,
+      authConfig:
+        (await prepareOAuthSecret(
+          dropLegacyDcrMirror(clampTimeouts(input.authConfig)),
+          c.env,
+          undefined
+        )) ?? {},
+      enabled: input.enabled ?? true,
+      ownerUserId: input.private ? c.get('user').userId : null
+    })
+    // For unauth (`none`) upstreams there's nothing to wait for —
+    // warm the catalogue immediately so the admin sees a real tool
+    // count in the drawer instead of zero. user_bearer / user_oauth /
+    // shared_bearer all need credentials before refresh is meaningful;
+    // those are warmed on connect (PUT credentials / OAuth callback).
+    if (input.authStrategy === 'none') {
+      c.executionCtx.waitUntil(
+        warmCatalogueAndLog(c.env, {
+          upstreamId: row.id,
+          slug: row.slug,
+          bearerToken: null,
+          okContext: 'on create (auth=none)',
+          failLabel: 'post-create refresh'
+        })
+      )
+    }
+    const hydrated = await adminRowFor(c.env, row.id, c.get('user').userId)
+    await audit(c.env, {
+      actorId: c.get('user').userId,
+      action: 'upstream.create',
+      target: row.id,
+      meta: { slug: row.slug, private: row.owner_user_id !== null }
+    })
+    return c.json(hydrated, 201)
+  } catch (err) {
+    if (isUniqueViolation(err)) return c.json({ error: 'slug_taken' }, 409)
+    throw err
+  }
+})
+
+adminUpstreamsRoute.patch('/:id', async (c) => {
+  const id = c.req.param('id')
+  const current = await getUpstreamForAdmin(c.env, id, c.get('user').userId)
+  if (!current) return notFound(c)
+  const parsed = await parseJsonBody(c, UpdateUpstreamRequest)
+  if (!parsed.ok) return parsed.res
+  if (parsed.data.url && isSameOrigin(parsed.data.url, c.env.PUBLIC_BASE_URL)) {
+    return c.json({ error: 'self_loop', message: 'URL must not point at this ctxlayer instance' }, 400)
+  }
+  if (oauthEndpointSelfLoop(parsed.data.authConfig, c.env)) {
+    return c.json(
+      { error: 'self_loop', message: 'OAuth endpoints must not point at this ctxlayer instance' },
+      400
+    )
+  }
+  const currentConfig = parseAuthConfig(current.auth_config)
+  // The DCR registration stays valid only for the same server under the
+  // same strategy — see preserveDcrClient.
+  const keepDcrClient =
+    (parsed.data.authStrategy ?? current.auth_strategy) === 'user_oauth' &&
+    (parsed.data.url === undefined || parsed.data.url === current.url)
+  await patchUpstream(c.env, id, {
+    ...parsed.data,
+    authConfig: preserveDcrClient(
+      await prepareOAuthSecret(
+        dropLegacyDcrMirror(clampTimeouts(parsed.data.authConfig)),
+        c.env,
+        currentConfig
+      ),
+      currentConfig,
+      keepDcrClient
+    )
+  })
+  await audit(c.env, {
+    actorId: c.get('user').userId,
+    action: 'upstream.update',
+    target: id,
+    meta: { fields: Object.keys(parsed.data) }
+  })
+  return new Response(null, { status: 204 })
+})
+
+adminUpstreamsRoute.delete('/:id', async (c) => {
+  const id = c.req.param('id')
+  // Resolve first: the DELETE must not reach another user's private
+  // upstream by id. A miss stays a 204 (idempotent, as before).
+  const row = await getUpstreamForAdmin(c.env, id, c.get('user').userId)
+  if (!row) return new Response(null, { status: 204 })
+  await deleteUpstream(c.env, id)
+  await audit(c.env, {
+    actorId: c.get('user').userId,
+    action: 'upstream.delete',
+    target: id,
+    meta: { slug: row.slug }
+  })
+  return new Response(null, { status: 204 })
+})
+
+/**
+ * "Share with org" — the one way out of private. Only the owner can (nobody
+ * else can even see it). The upstream arrives with no grants, so it stays
+ * invisible to everyone else until visibility is granted; credentials stay
+ * per-user as before.
+ */
+adminUpstreamsRoute.post('/:id/share', async (c) => {
+  const id = c.req.param('id')
+  const userId = c.get('user').userId
+  const row = await getUpstreamForAdmin(c.env, id, userId)
+  if (!row) return notFound(c)
+  if (row.owner_user_id === null) return c.json({ error: 'not_private' }, 409)
+  if (!(await shareUpstreamWithOrg(c.env, id, userId))) return notFound(c)
+  await audit(c.env, {
+    actorId: userId,
+    action: 'upstream.share',
+    target: id,
+    meta: { slug: row.slug }
+  })
+  return c.json(await adminRowFor(c.env, id, userId))
+})
+
+// Replace the visibility rule-set for one upstream in a single batch.
+adminUpstreamsRoute.put('/:id/visibility', async (c) => {
+  const id = c.req.param('id')
+  const row = await getUpstreamForAdmin(c.env, id, c.get('user').userId)
+  if (!row) return notFound(c)
+  if (row.owner_user_id !== null) return privateUpstream(c)
+  const parsed = await parseJsonBody(c, ReplaceVisibilityRequest)
+  if (!parsed.ok) return parsed.res
+  await replaceVisibility(c.env, id, parsed.data.rules)
+  await audit(c.env, {
+    actorId: c.get('user').userId,
+    action: 'upstream.visibility_set',
+    target: id,
+    meta: { rules: parsed.data.rules.length }
+  })
+  return new Response(null, { status: 204 })
+})
+
+/**
+ * Per-tool ACL for one upstream. GET returns the current rule sets
+ * grouped by tool, each flagged `orphaned` when its tool_name is no
+ * longer in the cached catalogue (an upstream rename strands the rule —
+ * surfaced, never silently dropped, or the renamed tool re-opens). A
+ * tool absent from this list has no rules and inherits upstream
+ * visibility (open to anyone who can see the upstream).
+ */
+adminUpstreamsRoute.get('/:id/tool-access', async (c) => {
+  const id = c.req.param('id')
+  if (!(await getUpstreamForAdmin(c.env, id, c.get('user').userId))) return notFound(c)
+  const [rows, tools] = await Promise.all([
+    listToolAccessForUpstream(c.env, id),
+    listCachedTools(c.env, id)
+  ])
+  const live = new Set(tools.map((t) => t.tool_name))
+  const byTool = new Map<string, ToolAccessRule[]>()
+  for (const r of rows) {
+    const list = byTool.get(r.tool_name) ?? []
+    list.push({
+      principalKind: r.principal_kind,
+      principalId: r.principal_kind === 'everyone' ? null : r.principal_id
+    })
+    byTool.set(r.tool_name, list)
+  }
+  const entries: ToolAccessEntry[] = [...byTool.entries()].map(([toolName, rules]) => ({
+    toolName,
+    rules,
+    orphaned: !live.has(toolName)
+  }))
+  const body: UpstreamToolAccessResponse = { upstreamId: id, entries }
+  return c.json(body)
+})
+
+// Replace the ENTIRE rule set for one tool. Empty `rules` reverts the
+// tool to inherit (open).
+adminUpstreamsRoute.put('/:id/tool-access', async (c) => {
+  const id = c.req.param('id')
+  const row = await getUpstreamForAdmin(c.env, id, c.get('user').userId)
+  if (!row) return notFound(c)
+  if (row.owner_user_id !== null) return privateUpstream(c)
+  const parsed = await parseJsonBody(c, ReplaceToolAccessRequest)
+  if (!parsed.ok) return parsed.res
+  await replaceToolAccessForTool(c.env, id, parsed.data.toolName, parsed.data.rules)
+  await audit(c.env, {
+    actorId: c.get('user').userId,
+    action: 'upstream.tool_access_set',
+    target: id,
+    meta: { tool: parsed.data.toolName, rules: parsed.data.rules.length }
+  })
+  return new Response(null, { status: 204 })
+})
+
+/**
+ * Read the cached tool list for an upstream. Backs the expand-row
+ * drill-down on /app/admin/upstreams. Read-only; doesn't trigger a
+ * refresh. If the cache is empty (newly created, never warmed) the
+ * `tools` array is empty and the admin can click the existing
+ * "Refresh tools" button to populate it.
+ */
+adminUpstreamsRoute.get('/:id/tools', async (c) => {
+  const id = c.req.param('id')
+  const row = await getUpstreamForAdmin(c.env, id, c.get('user').userId)
+  if (!row) return notFound(c)
+  // Admin view sees drafts as well as published; non-admin user route
+  // (api/upstreams.ts) only sees published.
+  return c.json(
+    await buildUpstreamToolsPayload(c.env, { id, slug: row.slug }, { includeDrafts: true })
+  )
+})
+
+/**
+ * Admin-triggered catalogue refresh. Uses the calling admin's own
+ * credentials for upstreams that need them (paste-bearer for
+ * `user_bearer`, OAuth tokens for `user_oauth`, no creds for `none`).
+ * If the admin hasn't connected the upstream on `/upstreams` yet, we
+ * tell them so they can connect once and reuse the refresh button
+ * thereafter. The per-user MCP session refresh path is still available
+ * as a fallback for non-admin users on session init.
+ */
+adminUpstreamsRoute.post('/:id/refresh-tools', async (c) => {
+  const id = c.req.param('id')
+  const row = await getUpstreamForAdmin(c.env, id, c.get('user').userId)
+  if (!row) return notFound(c)
+  let conn: ReturnType<typeof toUpstreamConnection>
+  try {
+    conn = toUpstreamConnection(row)
+  } catch {
+    return c.json({ error: 'unsupported_transport' }, 400)
+  }
+  const userId = c.get('user').userId
+  const bearer = await resolveUserUpstreamBearer(c.env, row, conn, userId)
+  if (conn.authStrategy !== 'none' && bearer === null) {
+    return c.json(
+      {
+        error: 'admin_not_connected',
+        hint: `Connect this upstream on /upstreams as ${conn.authStrategy}, then try again.`
+      },
+      400
+    )
+  }
+  // `force` bypasses the catalogue shrink-guard: the admin button is the
+  // deliberate path for applying a genuine large tool removal.
+  const result = await refreshCatalogueForConnection(c.env, conn, bearer, { force: true })
+  if (!result.ok) {
+    return c.json({ error: 'refresh_failed', message: result.message }, 502)
+  }
+  const body: RefreshToolsResponse = {
+    upstreamId: id,
+    slug: result.slug,
+    toolsCount: result.toolsCount,
+    cachedAt: result.cachedAt
+  }
+  return c.json(body)
+})
+
+/**
+ * Set / replace the shared bearer token for a `shared_bearer` upstream.
+ * The whole org uses this token for outbound calls — there's no
+ * per-user storage. Caller's user id goes in `created_by` for the
+ * audit trail. After the upsert, warm the catalogue in waitUntil
+ * (admin doesn't need to click Refresh).
+ */
+adminUpstreamsRoute.put('/:id/shared-credentials', async (c) => {
+  const id = c.req.param('id')
+  const row = await getUpstreamForAdmin(c.env, id, c.get('user').userId)
+  if (!row) return notFound(c)
+  if (row.auth_strategy !== 'shared_bearer') {
+    return c.json({ error: 'auth_strategy_mismatch', expected: 'shared_bearer' }, 400)
+  }
+  const parsed = await parseJsonBody(c, PasteBearerRequest)
+  if (!parsed.ok) return parsed.res
+  const actor = c.get('user')
+  const sealed = await seal(parsed.data.token, c.env.ENCRYPTION_KEY)
+  await upsertSharedCredential(c.env, id, {
+    kind: 'bearer',
+    ciphertext: sealed.ciphertext,
+    iv: sealed.iv,
+    keyVersion: sealed.keyVersion,
+    createdBy: actor.userId
+  })
+  await audit(c.env, {
+    actorId: actor.userId,
+    action: 'upstream.shared_bearer_set',
+    target: id,
+    meta: { slug: row.slug }
+  })
+  // Warm catalogue immediately so the admin sees toolsCount populate
+  // without a manual Refresh click.
+  c.executionCtx.waitUntil(
+    warmCatalogueAndLog(c.env, {
+      upstreamId: id,
+      slug: row.slug,
+      bearerToken: parsed.data.token,
+      okContext: 'after shared-bearer set',
+      failLabel: 'shared-bearer refresh'
+    })
+  )
+  return new Response(null, { status: 204 })
+})
+
+adminUpstreamsRoute.delete('/:id/shared-credentials', async (c) => {
+  const id = c.req.param('id')
+  const row = await getUpstreamForAdmin(c.env, id, c.get('user').userId)
+  if (!row) return notFound(c)
+  const actor = c.get('user')
+  await deleteSharedCredential(c.env, id)
+  await audit(c.env, {
+    actorId: actor.userId,
+    action: 'upstream.shared_bearer_clear',
+    target: id,
+    meta: { slug: row.slug }
+  })
+  return new Response(null, { status: 204 })
+})
+

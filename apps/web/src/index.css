@@ -1,0 +1,502 @@
+/*
+ * Theme tokens follow the roadmapper surface system: a dark navy stack
+ * with a sibling light variant, and a single blue accent. Mantine sets
+ * `data-mantine-color-scheme` on <html>; our vars switch on that so the
+ * editor / inline-styled bits track the toggle automatically.
+ *
+ * Shape scale and surface naming mirror roadmapper/frontend/app.css so
+ * future components copy across cleanly.
+ */
+
+:root,
+:root[data-mantine-color-scheme="dark"] {
+  color-scheme: dark;
+  --bg: #0f1117;
+  --bg-surface: #1a1d27;
+  --bg-elevated: #242836;
+  --border: #353b50;
+
+  --text: #f8fafc;
+  --text-muted: #c8d2e0;
+  --text-dim: #94a3b8;
+
+  --accent: #3b82f6; /* blue-500, brighter in dark mode */
+
+  --brand: #f38020; /* ctxlayer orange — matches the marketing site logo */
+
+  --sidebar-w: 220px;
+  --header-h: 56px;
+  --radius: 6px;
+  --radius-sm: 4px;
+}
+
+:root[data-mantine-color-scheme="light"] {
+  color-scheme: light;
+  --bg: #f1f5f9;
+  --bg-surface: #ffffff;
+  --bg-elevated: #f8fafc;
+  --border: #cbd5e1;
+
+  --text: #0f172a;
+  --text-muted: #475569;
+  --text-dim: #64748b;
+
+  --accent: #2563eb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+/* ── Shell layout ──────────────────────────────────────────── */
+.shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  /* Lock the shell to the viewport (was min-height:100%, which let the shell
+     grow with content so the whole page scrolled). With a fixed height the
+     header + sidebar stay put and `.main-content` (overflow:auto) is the
+     scroll container — required for the docs workspace's independent panes. */
+  height: 100%;
+}
+
+.sidebar {
+  background: var(--bg-surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 16px 12px;
+  gap: 4px;
+  /* The shell is viewport-locked, so a tall nav scrolls within the sidebar
+     rather than pushing the shell past the viewport. */
+  min-height: 0;
+  overflow: auto;
+}
+
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 12px;
+  font-weight: 700;
+  font-size: 16px;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  text-decoration: none;
+}
+.sidebar-brand:hover {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.sidebar-group-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  padding: 16px 10px 4px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: 13px;
+  text-decoration: none;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+.nav-item:hover {
+  background: var(--bg-elevated);
+  color: var(--text);
+  text-decoration: none;
+}
+.nav-item.active {
+  background: var(--accent);
+  color: white;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.user-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  font-size: 12px;
+}
+.user-chip-email {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-chip-role {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+
+/* Logo mark — keep brand orange even when the brand link hovers to accent
+   (explicit colour on the SVG element wins over the inherited currentColor). */
+.brand-mark {
+  color: var(--brand);
+  flex: none;
+}
+
+/* Build-provenance stamp under the user chip. */
+.app-version {
+  padding: 0 10px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+}
+
+.main-area {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  /* Allow `.main-content` (flex:1, overflow:auto) to bound + scroll instead of
+     stretching the shell past the viewport. */
+  min-height: 0;
+}
+
+.main-header {
+  height: var(--header-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+
+.main-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.main-content {
+  flex: 1;
+  padding: 24px;
+  overflow: auto;
+}
+
+/* ── Auth screen ───────────────────────────────────────────── */
+.auth-shell {
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.auth-card {
+  width: 100%;
+  max-width: 380px;
+  padding: 28px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* ── Data table ────────────────────────────────────────────── */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.data-table th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 10px 14px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+/* Sortable header: the button fills the cell so the whole header is the
+   hit target, and inherits the th typography. The arrow is reserved
+   space — it fades in on hover and stays lit for the active column, so
+   toggling a sort never reflows the column widths. */
+.data-table th.th-sortable {
+  padding: 0;
+}
+.data-table th.th-sortable > button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  padding: 10px 14px;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  color: inherit;
+  text-align: left;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.data-table th.th-sortable > button:hover {
+  color: var(--text);
+}
+.data-table th.th-sortable > button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.data-table th.th-sortable .th-arrow {
+  font-size: 10px;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+.data-table th.th-sortable > button:hover .th-arrow {
+  opacity: 0.5;
+}
+.data-table th.th-sortable .th-arrow.is-active {
+  opacity: 1;
+}
+
+.data-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--text);
+  vertical-align: top;
+}
+.data-table tbody tr:last-child td {
+  border-bottom: none;
+}
+.data-table tbody tr {
+  transition: background-color 0.1s ease;
+}
+/* Pointer cursor is opt-in: only rows that actually open something
+   (spread `clickableRow(...)` from lib/a11y.ts) advertise clickability.
+   Read-only tables (usage breakdowns, tool lists) keep the default. */
+.data-table tbody tr.row-clickable {
+  cursor: pointer;
+}
+.data-table tbody tr:hover {
+  background: var(--bg-elevated);
+}
+
+.text-muted {
+  color: var(--text-muted);
+}
+.text-dim {
+  color: var(--text-dim);
+}
+
+/* ── BlockNote side-menu (add + drag handle) ───────────────── */
+/* Defaults are oversized for a quiet doc tool. Bring them down,
+   tuck them tighter together, push the pair a little further from
+   the block they belong to, and dim them until hovered. */
+.bn-side-menu {
+  display: inline-flex;
+  align-items: center;
+  gap: 0; /* + and handle sit flush */
+  margin-right: 6px; /* push pair away from the block content */
+  opacity: 0.65;
+  transition: opacity 0.15s ease;
+}
+:root[data-mantine-color-scheme="dark"] .bn-side-menu {
+  opacity: 0.45;
+}
+.bn-side-menu:hover,
+.bn-block-content:hover ~ .bn-side-menu,
+[data-node-type="blockOuter"]:hover .bn-side-menu {
+  opacity: 1;
+}
+.bn-side-menu button,
+.bn-side-menu .mantine-ActionIcon-root,
+.bn-side-menu [role="button"] {
+  width: 20px !important;
+  height: 20px !important;
+  min-width: 20px !important;
+  min-height: 20px !important;
+  padding: 2px !important;
+  border-radius: 6px !important; /* softer than the default 4 */
+}
+.bn-side-menu svg {
+  width: 14px !important;
+  height: 14px !important;
+  stroke-width: 1.5 !important;
+}
+
+/* ── BlockNote table row/column reorder handles ────────────── */
+.bn-table-handle,
+.bn-table-cell-handle {
+  border-radius: 6px !important;
+  opacity: 0.65;
+  transition: opacity 0.15s ease;
+}
+:root[data-mantine-color-scheme="dark"] .bn-table-handle,
+:root[data-mantine-color-scheme="dark"] .bn-table-cell-handle {
+  opacity: 0.45;
+}
+.bn-table-handle:hover,
+.bn-table-cell-handle:hover,
+table:hover .bn-table-handle,
+table:hover .bn-table-cell-handle {
+  opacity: 1;
+}
+.bn-table-handle,
+.bn-table-cell-handle,
+.bn-table-handle button,
+.bn-table-cell-handle button {
+  width: 18px !important;
+  height: 18px !important;
+  min-width: 18px !important;
+  min-height: 18px !important;
+  padding: 1px !important;
+}
+.bn-table-handle svg,
+.bn-table-cell-handle svg {
+  width: 13px !important;
+  height: 13px !important;
+  stroke-width: 1.5 !important;
+}
+
+/* ── Editor canvas — breathe at the top ────────────────────── */
+.bn-editor {
+  padding-top: 32px !important;
+}
+
+/* ── Editor typography ─────────────────────────────────────── */
+/* BlockNote ships Inter and sets it as the editor font. The rest
+   of the SPA uses the system font, so the chrome→canvas transition
+   looks like switching apps. Override BlockNote's family back to
+   the SPA's so it feels native, and drop the body size a notch so
+   docs render at chrome size rather than the bigger 16px default. */
+.bn-editor,
+.bn-container,
+.bn-mantine,
+.bn-mantine [contenteditable="true"] {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif !important;
+}
+.bn-editor,
+.bn-block-content[data-content-type="paragraph"],
+.bn-block-content[data-content-type="bulletListItem"],
+.bn-block-content[data-content-type="numberedListItem"],
+.bn-block-content[data-content-type="checkListItem"],
+.bn-block-content[data-content-type="toggleListItem"],
+.bn-block-content[data-content-type="quote"] {
+  font-size: 14px !important;
+  line-height: 1.55;
+}
+
+/* Tables + code blocks: a denser type for content that's already
+   visually heavier than prose. */
+.bn-block-content[data-content-type="table"] table,
+.bn-block-content[data-content-type="table"] td,
+.bn-block-content[data-content-type="table"] th {
+  font-size: 12px !important;
+  line-height: 1.4;
+}
+.bn-block-content[data-content-type="codeBlock"],
+.bn-block-content[data-content-type="codeBlock"] pre,
+.bn-block-content[data-content-type="codeBlock"] code {
+  font-size: 12px !important;
+  line-height: 1.45;
+}
+
+/*
+ * Slideout drawers: Mantine's size presets run too narrow for our
+ * forms, so every named size is scaled by 1.15 (base values live in
+ * @mantine/core/styles.css, imported before this file — equal
+ * specificity, later in the cascade, so these win). Small screens are
+ * still safe: the drawer content also carries max-width: 100%.
+ */
+.mantine-Drawer-root {
+  --drawer-size-xs: calc(23rem * var(--mantine-scale));
+  --drawer-size-sm: calc(27.3125rem * var(--mantine-scale));
+  --drawer-size-md: calc(31.625rem * var(--mantine-scale));
+  --drawer-size-lg: calc(44.5625rem * var(--mantine-scale));
+  --drawer-size-xl: calc(56.0625rem * var(--mantine-scale));
+}
+
+/*
+ * Transient highlight applied by the editor when a search deep-link
+ * (?section=<anchor>) scrolls to a heading block. Added for ~2s then
+ * removed; the transition fades it back out.
+ */
+.ctx-section-flash {
+  animation: ctx-section-flash 2s ease-out;
+  border-radius: var(--radius-sm);
+}
+@keyframes ctx-section-flash {
+  0% {
+    background-color: color-mix(in srgb, var(--accent) 32%, transparent);
+    box-shadow: -6px 0 0 color-mix(in srgb, var(--accent) 60%, transparent);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: -6px 0 0 transparent;
+  }
+}

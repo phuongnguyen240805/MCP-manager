@@ -1,0 +1,149 @@
+/**
+ * Catalogue-refresh helper. Used by:
+ *   - the admin "Refresh tools" endpoint (for `none` / `shared_bearer`
+ *     upstreams that don't need a per-user token);
+ *   - the user `PUT /api/upstreams/:id/credentials` flow, which fires
+ *     a refresh in `ctx.waitUntil` so the cached `upstream_tools`
+ *     populates without waiting for the next MCP session;
+ *   - the per-session `UpstreamProxyRegistry` when a cache is empty
+ *     or older than the TTL.
+ *
+ * Best-effort: failures are logged and surfaced via the return value
+ * so callers can decide whether to bubble them up (admin) or swallow
+ * them (user paste, waitUntil background).
+ */
+
+import type { Env } from '../env'
+import {
+  getUpstreamById,
+  toUpstreamConnection,
+  type UpstreamConnection
+} from '../db/queries/upstreams'
+import { replaceCachedTools } from '../db/queries/upstream-tools'
+import { createUpstreamClient } from './create-client'
+import { errMessage } from '../util/errors'
+
+export interface CatalogueRefreshOk {
+  ok: true
+  slug: string
+  toolsCount: number
+  cachedAt: number
+  /** The write was rejected by the shrink-guard; `toolsCount` is the KEPT prior count. */
+  suspectShrink?: { prior: number; incoming: number }
+}
+
+export interface CatalogueRefreshErr {
+  ok: false
+  reason: 'not_found' | 'unsupported_transport' | 'no_credentials' | 'listTools_failed'
+  message?: string
+  /** HTTP status when the failure came from an upstream POST (else absent). */
+  status?: number
+}
+
+export type CatalogueRefreshResult = CatalogueRefreshOk | CatalogueRefreshErr
+
+export async function refreshCatalogueByUpstreamId(
+  env: Env,
+  upstreamId: string,
+  bearerToken: string | null,
+  opts?: { force?: boolean }
+): Promise<CatalogueRefreshResult> {
+  const row = await getUpstreamById(env, upstreamId)
+  if (!row) return { ok: false, reason: 'not_found' }
+  let conn: UpstreamConnection
+  try {
+    conn = toUpstreamConnection(row)
+  } catch {
+    return { ok: false, reason: 'unsupported_transport' }
+  }
+  return refreshCatalogueForConnection(env, conn, bearerToken, opts)
+}
+
+export async function refreshCatalogueForConnection(
+  env: Env,
+  conn: UpstreamConnection,
+  bearerToken: string | null,
+  opts?: { force?: boolean }
+): Promise<CatalogueRefreshResult> {
+  if (conn.authStrategy !== 'none' && !bearerToken) {
+    return { ok: false, reason: 'no_credentials' }
+  }
+  const client = createUpstreamClient(conn, bearerToken)
+  try {
+    const tools = await client.listTools()
+    const res = await replaceCachedTools(env, conn.id, tools, opts)
+    if (res.rejectedShrink) {
+      return {
+        ok: true,
+        slug: conn.slug,
+        toolsCount: res.rejectedShrink.prior,
+        cachedAt: res.cachedAt,
+        suspectShrink: res.rejectedShrink
+      }
+    }
+    return { ok: true, slug: conn.slug, toolsCount: tools.length, cachedAt: res.cachedAt }
+  } catch (err) {
+    // MCP transport errors (StreamableHTTPError / SseError) carry `code` = the
+    // upstream HTTP status. Surface it: a bare "Error POSTing to endpoint:" is
+    // unactionable, but "HTTP 401 …" vs "HTTP 404 …" tells auth-vs-URL apart at
+    // a glance (this is what made the ADO remote-MCP 401 legible). JSON-RPC
+    // errors carry a negative `code` (e.g. Linear's -32002) whose text is
+    // already in the message, so only an HTTP-range code gets the prefix.
+    const status = httpStatusOf(err)
+    const base = errMessage(err)
+    return {
+      ok: false,
+      reason: 'listTools_failed',
+      status,
+      message: status ? `HTTP ${status}: ${base}` : base
+    }
+  } finally {
+    await client.close()
+  }
+}
+
+/**
+ * `waitUntil`-friendly wrapper: refresh the catalogue and log the
+ * outcome instead of returning it. For background warms (e.g. right
+ * after an admin creates an unauthenticated upstream) where nobody is
+ * waiting on the result — failures must be visible in logs but never
+ * bubble. `okContext` / `failLabel` keep each call site's log lines
+ * distinguishable.
+ */
+export async function warmCatalogueAndLog(
+  env: Env,
+  args: {
+    upstreamId: string
+    slug: string
+    bearerToken: string | null
+    /** Tail of the success line, e.g. 'on create (auth=none)'. */
+    okContext: string
+    /** Subject of the failure lines, e.g. 'post-create refresh'. */
+    failLabel: string
+  }
+): Promise<void> {
+  try {
+    const r = await refreshCatalogueByUpstreamId(env, args.upstreamId, args.bearerToken)
+    if (r.ok) {
+      const shrinkNote = r.suspectShrink
+        ? ` (suspect shrink ${r.suspectShrink.prior}→${r.suspectShrink.incoming} rejected, prior kept)`
+        : ''
+      console.log(`[catalogue] ${r.slug}: warmed ${r.toolsCount} tools ${args.okContext}${shrinkNote}`)
+    } else {
+      console.warn(
+        `[catalogue] ${args.slug}: ${args.failLabel} failed (${r.reason})${
+          r.message ? `: ${r.message}` : ''
+        }`
+      )
+    }
+  } catch (err) {
+    const msg = errMessage(err)
+    console.error(`[catalogue] ${args.slug}: ${args.failLabel} threw: ${msg}`)
+  }
+}
+
+/** Pull the upstream HTTP status off a transport error, or undefined. */
+function httpStatusOf(err: unknown): number | undefined {
+  const code = (err as { code?: unknown } | null)?.code
+  return typeof code === 'number' && code >= 100 && code <= 599 ? code : undefined
+}

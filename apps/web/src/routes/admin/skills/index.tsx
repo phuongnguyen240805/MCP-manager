@@ -1,0 +1,166 @@
+import { useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { Badge, Button, Group, Select, Text, TextInput } from '@mantine/core'
+import { ListPageShell } from '../../../components/list-page-shell'
+import { clickableRow } from '../../../lib/a11y'
+import { fetchSkills } from '../../../lib/api'
+import { relativeTime } from '../../../lib/time'
+import { useLoad } from '../../../lib/use-load'
+import { personLabel } from '../../../lib/person'
+import { explain } from '../../skills/helpers'
+import { CreateSkillModal } from '../../skills/CreateSkillModal'
+import { SkillDrawer } from '../../skills/SkillDrawer'
+import { StatusBadge } from '../../skills/badges'
+
+type StatusFilter = 'all' | 'draft' | 'published' | 'archived'
+
+export function AdminSkills() {
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [creating, setCreating] = useState(false)
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  const [query, setQuery] = useState('')
+  const nav = useNavigate()
+
+  const {
+    data: items,
+    error,
+    reload
+  } = useLoad(
+    (signal) => fetchSkills({ status: statusFilter === 'all' ? undefined : statusFilter }, signal),
+    [statusFilter],
+    { explain }
+  )
+
+  const filtered = useMemo(() => {
+    if (!items) return null
+    const q = query.trim().toLowerCase()
+    if (!q) return items
+    return items.filter(
+      (s) =>
+        s.title.toLowerCase().includes(q) ||
+        s.slug.toLowerCase().includes(q) ||
+        s.description.toLowerCase().includes(q)
+    )
+  }, [items, query])
+
+  return (
+    <>
+      <ListPageShell
+        title="Admin · Skills"
+        action={
+          <Group gap="xs">
+            <Select
+              size="xs"
+              value={statusFilter}
+              onChange={(v) => setStatusFilter((v as StatusFilter) ?? 'all')}
+              data={[
+                { value: 'all', label: 'All' },
+                { value: 'draft', label: 'Draft' },
+                { value: 'published', label: 'Published' },
+                { value: 'archived', label: 'Archived' }
+              ]}
+              w={140}
+            />
+            <TextInput
+              size="xs"
+              aria-label="Filter skills"
+              placeholder="Filter by title or slug…"
+              value={query}
+              onChange={(e) => setQuery(e.currentTarget.value)}
+              w={260}
+            />
+            <Button size="xs" onClick={() => setCreating(true)}>
+              New skill
+            </Button>
+          </Group>
+        }
+        error={error}
+        loading={!items && !error}
+        empty={
+          items && items.length === 0 ? (
+            <Text c="dimmed">
+              No skills yet. Click <b>New skill</b> above to create the first one.
+            </Text>
+          ) : null
+        }
+      >
+        {filtered && filtered.length === 0 && items && items.length > 0 && (
+          <Text c="dimmed">No skills match "{query}".</Text>
+        )}
+
+        {filtered && filtered.length > 0 && (
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Title</th>
+                <th>Slug</th>
+                <th>Status</th>
+                <th>Description</th>
+                <th>Author</th>
+                <th>Updated</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((s) => (
+                <tr key={s.id} {...clickableRow(() => setEditingId(s.id))}>
+                  <td style={{ fontWeight: 500 }}>
+                    <Group gap="xs" wrap="nowrap">
+                      <span>{s.title}</span>
+                      {s.isStale && (
+                        <Badge
+                          color="yellow"
+                          variant="light"
+                          title="Attached upstream tool schema changed after this skill's last edit — review."
+                        >
+                          Stale
+                        </Badge>
+                      )}
+                    </Group>
+                  </td>
+                  <td className="text-muted">
+                    <code style={{ fontSize: 11 }}>{s.slug}</code>
+                  </td>
+                  <td>
+                    <StatusBadge status={s.status} />
+                  </td>
+                  <td className="text-muted" style={{ maxWidth: 380 }}>
+                    <Text fz="xs" c="dimmed" lineClamp={1}>
+                      {s.description}
+                    </Text>
+                  </td>
+                  <td className="text-muted" title={s.createdBy?.email || undefined}>
+                    {personLabel(s.createdBy)}
+                  </td>
+                  <td className="text-muted">{relativeTime(s.updatedAt)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </ListPageShell>
+
+      {editingId && (
+        <SkillDrawer
+          skillId={editingId}
+          isAdmin
+          onClose={() => setEditingId(null)}
+          onChanged={() => reload()}
+          onOpenEditor={(id) => {
+            setEditingId(null)
+            nav(`/app/admin/skills/${id}/edit`)
+          }}
+        />
+      )}
+
+      {creating && (
+        <CreateSkillModal
+          onClose={() => setCreating(false)}
+          onCreated={(id) => {
+            setCreating(false)
+            nav(`/app/admin/skills/${id}/edit`)
+          }}
+        />
+      )}
+    </>
+  )
+}

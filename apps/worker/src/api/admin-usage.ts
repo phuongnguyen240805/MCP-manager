@@ -1,0 +1,70 @@
+/**
+ * Admin usage REST. `GET /api/admin/usage?range=30d&userId=...&upstreamId=...`
+ * returns rollups scoped to the (optional) user / upstream filters, plus a
+ * top-users leaderboard for the org-wide view. All filters are AND-combined
+ * and the leaderboards follow the selected time window.
+ *
+ * Read-only and admin-gated — see `auth/middleware.ts:requireAdmin`.
+ */
+
+import { Hono } from 'hono'
+import type { AdminUsageResponse, UsageErrorsResponse } from '@ctxlayer/shared'
+import type { Env } from '../env'
+import { requireAdmin, type AuthedVariables } from '../auth/middleware'
+import {
+  dailyTotals,
+  topTools,
+  topUpstreams,
+  topUsers,
+  recentErrors,
+  asyncJobStats,
+  rangeCutoff
+} from '../db/queries/usage-read'
+import { ERRORS_PAGE_LIMIT, parseRange, parseOffset } from './usage'
+
+export const adminUsageRoute = new Hono<{ Bindings: Env; Variables: AuthedVariables }>()
+adminUsageRoute.use('*', requireAdmin)
+
+adminUsageRoute.get('/', async (c) => {
+  const url = new URL(c.req.url)
+  const range = parseRange(url.searchParams.get('range'))
+  const offsetSec = parseOffset(url.searchParams.get('tz'))
+  const userId = url.searchParams.get('userId')?.trim() || null
+  const upstreamId = url.searchParams.get('upstreamId')?.trim() || null
+
+  const scope = { sinceDay: rangeCutoff(range, offsetSec), userId, upstreamId }
+  const [daily, tools, upstreams, users, asyncStats] = await Promise.all([
+    dailyTotals(c.env, scope),
+    topTools(c.env, scope, 10),
+    topUpstreams(c.env, scope, 10),
+    topUsers(c.env, scope, 10),
+    asyncJobStats(c.env, scope)
+  ])
+
+  const body: AdminUsageResponse = {
+    range,
+    dailyTotals: daily,
+    topTools: tools,
+    topUpstreams: upstreams,
+    topUsers: users,
+    asyncSummary: asyncStats.summary,
+    asyncJobs: asyncStats.jobs
+  }
+  return c.json(body)
+})
+
+// Dedicated feed for the Admin · Errors page. Accepts the same optional
+// userId / upstreamId scoping as `/` for deep-linked drill-downs.
+adminUsageRoute.get('/errors', async (c) => {
+  const url = new URL(c.req.url)
+  const range = parseRange(url.searchParams.get('range'))
+  const offsetSec = parseOffset(url.searchParams.get('tz'))
+  const userId = url.searchParams.get('userId')?.trim() || null
+  const upstreamId = url.searchParams.get('upstreamId')?.trim() || null
+  const scope = { sinceDay: rangeCutoff(range, offsetSec), userId, upstreamId }
+  const body: UsageErrorsResponse = {
+    range,
+    errors: await recentErrors(c.env, scope, ERRORS_PAGE_LIMIT)
+  }
+  return c.json(body)
+})

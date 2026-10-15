@@ -1,0 +1,44 @@
+{
+  "name": "@ctxlayer/web",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "predev": "bun ../../scripts/setup-dev-tls.mjs",
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'covered by root biome lint'",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "echo 'no e2e suite; component smoke tests live in src/**/*.smoke.test.tsx (bun run test)'"
+  },
+  "dependencies": {
+    "@blocknote/core": "^0.51.2",
+    "@blocknote/mantine": "^0.51.2",
+    "@blocknote/react": "^0.51.2",
+    "@ctxlayer/shared": "workspace:*",
+    "@mantine/core": "^9.2.1",
+    "@mantine/hooks": "^9.2.1",
+    "lib0": "^0.2.117",
+    "react": "^19",
+    "react-dom": "^19",
+    "react-router-dom": "^6.27.0",
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.30",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^4.3.2",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.0",
+    "vitest": "^4.1.10"
+  }
+}

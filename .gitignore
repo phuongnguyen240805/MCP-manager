@@ -1,0 +1,20 @@
+node_modules/
+dist/
+.wrangler/
+.dev-tls/
+.dev.vars
+.dev.vars.local
+.prod.vars
+# Per-environment rendered wrangler configs (e.g. wrangler.dev.toml), generated
+# at deploy time. The base `wrangler.toml` has no middle segment so it is NOT
+# matched and stays tracked.
+wrangler.*.toml
+*.log
+.DS_Store
+.env
+.env.local
+coverage/
+playwright-report/
+test-results/
+.vite/
+*.tsbuildinfo

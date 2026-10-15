@@ -1,0 +1,393 @@
+/**
+ * Skills REST surface. Reads follow the skill read gate (admin, owner,
+ * or org-shared+published — see skills/skill-access.ts); writes are
+ * owner-or-admin. Attaching a skill to an upstream stays admin-only
+ * (api/skill-attachments.ts) — that surface fans the skill onto every
+ * tool description, so it's the one authoring action non-owners can't do.
+ */
+
+import { Hono, type Context } from 'hono'
+import { z } from 'zod'
+import {
+  CreateSkillRequest,
+  RestoreRequest,
+  SkillStatus,
+  UpdateSkillRequest,
+  type SkillAttachmentRef,
+  type SkillContentSaveResult,
+  type SkillDetail,
+  type SkillRevisionSummary,
+  type SkillSummary
+} from '@ctxlayer/shared'
+import type { Env } from '../env'
+import { requireUser, type AuthedVariables } from '../auth/middleware'
+import { requireCsrf } from '../auth/csrf'
+import { canReadSkill, canWriteSkill } from '../skills/skill-access'
+import {
+  createSkill,
+  getSkillById,
+  getSkillRevision,
+  listSkillRevisions,
+  listSkillsForAdmin,
+  listSkillsVisibleToUser,
+  patchSkill,
+  recordSkillRevision,
+  skillRevisionQueries,
+  softDeleteSkill,
+  type SkillRevisionRow,
+  type SkillWithUsersRow
+} from '../db/queries/skills'
+import { listAttachmentsForSkill } from '../db/queries/skill-attachments'
+import {
+  contentDigest,
+  deleteRevisionObjects,
+  readRevision,
+  readSnapshot,
+  restoreFromRevision,
+  writeRevisionAndSnapshot
+} from '../storage/skills-r2'
+import { audit } from '../audit/log'
+import { lintSkillBody } from '../skills/schema-linter'
+import { buildSkillExport, buildSkillExportEntry } from '../skills/export'
+import { renderSkillMd } from '../skills/skill-md'
+import { packArchive } from '../bundle/archive'
+import { notFound, parseJsonBody } from './respond'
+import { saveRevisionContent } from './revision-save'
+import { isUniqueViolation, newId } from '../db/queries/util'
+
+export const skillsRoute = new Hono<{ Bindings: Env; Variables: AuthedVariables }>()
+skillsRoute.use('*', requireUser)
+skillsRoute.use('*', requireCsrf)
+
+skillsRoute.get('/', async (c) => {
+  const { userId, role } = c.get('user')
+  // Parsed, not cast: an unknown value degrades to the default filter
+  // instead of lying to the type system (same pattern as usage parseRange).
+  const rawStatus = c.req.query('status')
+  const parsedStatus = SkillStatus.or(z.literal('all')).safeParse(rawStatus)
+  const status = parsedStatus.success ? parsedStatus.data : undefined
+  // Admin sees everything (status-filterable); a non-admin sees the
+  // org-shared library PLUS all of their own skills (private drafts
+  // included), so authoring and testing happen in the same list.
+  const rows =
+    role === 'admin'
+      ? await listSkillsForAdmin(c.env, { status })
+      : await listSkillsVisibleToUser(c.env, userId)
+  const body: SkillSummary[] = rows.map(toSummary)
+  return c.json(body)
+})
+
+skillsRoute.post('/', async (c) => {
+  const parsed = await parseJsonBody(c, CreateSkillRequest)
+  if (!parsed.ok) return parsed.res
+  const { userId, role } = c.get('user')
+  try {
+    const { content, ...meta } = parsed.data
+    // New skills default to private so authors can draft and test before
+    // sharing; admins keep 'org' for parity with pre-visibility behavior.
+    // An explicit `visibility` in the request always wins.
+    const visibility = meta.visibility ?? (role === 'admin' ? 'org' : 'private')
+    const row = await createSkill(c.env, { ...meta, visibility, createdBy: userId })
+    // If the caller supplied an initial body (CLI draft-skill does),
+    // persist a first revision now so the skill isn't empty on first
+    // read.
+    if (content) {
+      const revisionId = newId()
+      const put = await writeRevisionAndSnapshot(c.env, row.id, revisionId, content)
+      await recordSkillRevision(c.env, {
+        skillId: row.id,
+        revisionId,
+        authorId: userId,
+        r2Key: put.key,
+        byteSize: put.byteSize,
+        contentHash: put.contentHash
+      })
+    }
+    await audit(c.env, {
+      actorId: userId,
+      action: 'skill.create',
+      target: row.id,
+      meta: { draftedBy: parsed.data.drafterMeta ? 'cli' : 'manual' }
+    })
+    return c.json({ id: row.id, slug: row.slug }, 201)
+  } catch (err) {
+    if (isUniqueViolation(err)) return c.json({ error: 'slug_taken' }, 409)
+    throw err
+  }
+})
+
+// Bulk export: the whole published library as a zip of `<slug>/SKILL.md`
+// files — the web replacement for `ctxlayer pull` (unzip into
+// ~/.claude/skills/). Open-read like the library itself. Registered
+// before `/:id` so the literal path isn't captured as an id.
+skillsRoute.get('/export.zip', async (c) => {
+  const { skills } = await buildSkillExport(c.env)
+  const enc = new TextEncoder()
+  const files = skills.map((entry) => ({
+    path: `${entry.slug}/SKILL.md`,
+    bytes: enc.encode(renderSkillMd(entry, { provenance: true, forceLf: true }))
+  }))
+  return new Response(packArchive(files, 'zip'), {
+    status: 200,
+    headers: {
+      'content-type': 'application/zip',
+      'content-disposition': 'attachment; filename="ctxlayer-skills.zip"'
+    }
+  })
+})
+
+skillsRoute.get('/:id', async (c) => {
+  const id = c.req.param('id')
+  const { userId, role } = c.get('user')
+  const row = await getSkillById(c.env, id)
+  if (!row || !canReadSkill(row, userId, role)) return notFound(c)
+  const attachments = await listAttachmentsForSkill(c.env, id)
+  // `tags` left the shared schema in 2026-08: skill_tags never had a
+  // writer (always-empty arrays, one dead D1 round trip per detail).
+  // Emitted as a constant so pre-deploy SPA bundles keep parsing; drop
+  // the field on the next pass through this file.
+  const body = {
+    ...toSummary(row),
+    triggerText: row.trigger_text,
+    currentRevId: row.current_rev_id,
+    attachments: attachments.map(toAttachmentRef),
+    tags: { teams: [], products: [], tags: [] },
+    drafterMeta: parseDrafterMeta(row.drafter_meta)
+  } satisfies SkillDetail & { tags: unknown }
+  return c.json(body)
+})
+
+skillsRoute.patch('/:id', async (c) => {
+  const id = c.req.param('id')
+  const gate = await loadForWrite(c, id)
+  if (gate instanceof Response) return gate
+  const parsed = await parseJsonBody(c, UpdateSkillRequest)
+  if (!parsed.ok) return parsed.res
+  try {
+    await patchSkill(c.env, id, parsed.data)
+    await audit(c.env, { actorId: c.get('user').userId, action: 'skill.patch', target: id })
+    return new Response(null, { status: 204 })
+  } catch (err) {
+    if (isUniqueViolation(err)) return c.json({ error: 'slug_taken' }, 409)
+    throw err
+  }
+})
+
+skillsRoute.delete('/:id', async (c) => {
+  const id = c.req.param('id')
+  const gate = await loadForWrite(c, id)
+  if (gate instanceof Response) return gate
+  await softDeleteSkill(c.env, id)
+  await audit(c.env, { actorId: c.get('user').userId, action: 'skill.delete', target: id })
+  return new Response(null, { status: 204 })
+})
+
+skillsRoute.get('/:id/content', async (c) => {
+  const id = c.req.param('id')
+  const { userId, role } = c.get('user')
+  const row = await getSkillById(c.env, id)
+  if (!row || !canReadSkill(row, userId, role)) return notFound(c)
+  const content = (await readSnapshot(c.env, id)) ?? { blocks: [] }
+  return c.json(content)
+})
+
+// Per-skill SKILL.md download. Read-gated (canReadSkill), so an author can
+// export their own private draft to test it in Claude Code before sharing.
+skillsRoute.get('/:id/export', async (c) => {
+  const id = c.req.param('id')
+  const { userId, role } = c.get('user')
+  const row = await getSkillById(c.env, id)
+  if (!row || !canReadSkill(row, userId, role)) return notFound(c)
+  const md = renderSkillMd(await buildSkillExportEntry(c.env, row), {
+    provenance: true,
+    forceLf: true
+  })
+  return new Response(md, {
+    status: 200,
+    headers: {
+      'content-type': 'text/markdown; charset=utf-8',
+      // row.slug is a validated slug (safe header value).
+      'content-disposition': `attachment; filename="${row.slug}.SKILL.md"`
+    }
+  })
+})
+
+skillsRoute.put('/:id/content', async (c) => {
+  const id = c.req.param('id')
+  const { userId } = c.get('user')
+  const gate = await loadForWrite(c, id)
+  if (gate instanceof Response) return gate
+  const raw = await c.req.arrayBuffer()
+  // Autosave coalescing — same policy as docs (see db/revision-policy.ts).
+  // `?mode=autosave` opts into coalescing; absent/explicit cuts a checkpoint.
+  const explicit = c.req.query('mode') !== 'autosave'
+  const outcome = await saveRevisionContent(
+    c.env,
+    c.executionCtx,
+    {
+      queries: skillRevisionQueries,
+      contentDigest,
+      writeRevisionAndSnapshot,
+      deleteRevisionObjects
+    },
+    { parentId: id, userId, raw, explicit }
+  )
+  if (outcome.kind === 'too_large') return c.json({ error: 'content_too_large' }, 413)
+  if (outcome.kind === 'invalid') {
+    return c.json({ error: 'bad_request', issues: outcome.issues }, 400)
+  }
+  // Dedup / seal (`wrote: false`): the body is byte-identical to what's
+  // already persisted + linted, so skip the linter too.
+  let lintFindings: Awaited<ReturnType<typeof lintSkillBody>> = []
+  if (outcome.wrote) {
+    // Schema-reference linter runs after save. Warning-only — findings
+    // ride along but don't block. Lint failures themselves never fail
+    // the save (skill body is already persisted).
+    try {
+      lintFindings = await lintSkillBody(c.env, id, outcome.content)
+    } catch (err) {
+      console.error('skill linter failed (non-fatal):', err)
+    }
+  }
+  const body: SkillContentSaveResult = {
+    revisionId: outcome.revisionId,
+    byteSize: outcome.byteSize,
+    contentHash: outcome.contentHash,
+    lintFindings
+  }
+  return c.json(body)
+})
+
+skillsRoute.get('/:id/revisions', async (c) => {
+  const id = c.req.param('id')
+  const gate = await loadForWrite(c, id)
+  if (gate instanceof Response) return gate
+  const rows = await listSkillRevisions(c.env, id)
+  const body: SkillRevisionSummary[] = rows.map(toRevisionSummary)
+  return c.json(body)
+})
+
+skillsRoute.get('/:id/revisions/:rev/content', async (c) => {
+  const id = c.req.param('id')
+  const rev = c.req.param('rev')
+  const gate = await loadForWrite(c, id)
+  if (gate instanceof Response) return gate
+  if (!(await getSkillRevision(c.env, id, rev))) return notFound(c)
+  const content = await readRevision(c.env, id, rev)
+  if (!content) return notFound(c)
+  return c.json(content)
+})
+
+// Restore mirrors docs.ts POST /:id/restore: copy a source revision's
+// bytes to a fresh revision id + refresh the snapshot. No reindex enqueue
+// (skill save lints instead of reindexing; the lint is skipped on restore
+// since the body is just a verbatim copy of an already-saved revision).
+skillsRoute.post('/:id/restore', async (c) => {
+  const id = c.req.param('id')
+  const { userId } = c.get('user')
+  const gate = await loadForWrite(c, id)
+  if (gate instanceof Response) return gate
+  const parsed = await parseJsonBody(c, RestoreRequest)
+  if (!parsed.ok) return parsed.res
+  const sourceRev = await getSkillRevision(c.env, id, parsed.data.revisionId)
+  if (!sourceRev) return c.json({ error: 'revision_not_found' }, 404)
+  const newRevId = newId()
+  const put = await restoreFromRevision(c.env, id, sourceRev.id, newRevId)
+  if (!put) return c.json({ error: 'revision_body_missing' }, 410)
+  await recordSkillRevision(c.env, {
+    skillId: id,
+    revisionId: newRevId,
+    authorId: userId,
+    r2Key: put.key,
+    byteSize: put.byteSize,
+    contentHash: put.contentHash
+  })
+  await audit(c.env, { actorId: userId, action: 'skill.restore', target: id })
+  return c.json({ revisionId: newRevId })
+})
+
+// ----- helpers ------------------------------------------------------------
+
+type SkillCtx = Context<{ Bindings: Env; Variables: AuthedVariables }>
+
+/**
+ * Load a skill for a write/authoring op and enforce the gate. Returns
+ * the row when the caller may write it, otherwise the Response to send:
+ * 404 when the skill is missing OR not even readable (so a private
+ * skill's existence never leaks to a non-owner), 403 when it's readable
+ * but the caller isn't the owner or an admin. Use as:
+ *   `const gate = await loadForWrite(c, id); if (gate instanceof Response) return gate`.
+ */
+async function loadForWrite(c: SkillCtx, id: string): Promise<SkillWithUsersRow | Response> {
+  const { userId, role } = c.get('user')
+  const row = await getSkillById(c.env, id)
+  if (!row || !canReadSkill(row, userId, role)) return notFound(c)
+  if (!canWriteSkill(row, userId, role)) return c.json({ error: 'forbidden' }, 403)
+  return row
+}
+
+function toSummary(row: SkillWithUsersRow): SkillSummary {
+  return {
+    id: row.id,
+    slug: row.slug,
+    title: row.title,
+    description: row.description,
+    status: row.status,
+    visibility: row.visibility,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    isStale: row.is_stale === 1,
+    createdBy: row.created_by
+      ? {
+          id: row.created_by,
+          email: row.created_by_email ?? '',
+          name: row.created_by_name
+        }
+      : null,
+    updatedBy: row.updated_by_id
+      ? {
+          id: row.updated_by_id,
+          email: row.updated_by_email ?? '',
+          name: row.updated_by_name
+        }
+      : null
+  }
+}
+
+function toRevisionSummary(row: SkillRevisionRow): SkillRevisionSummary {
+  return {
+    id: row.id,
+    authorId: row.author_id,
+    createdAt: row.created_at,
+    byteSize: row.byte_size,
+    contentHash: row.content_hash,
+    kind: row.kind
+  }
+}
+
+function toAttachmentRef(row: {
+  upstream_id: string
+  upstream_slug: string
+  tool_name: string
+}): SkillAttachmentRef {
+  return {
+    upstreamId: row.upstream_id,
+    upstreamSlug: row.upstream_slug,
+    toolName: row.tool_name
+  }
+}
+
+
+/**
+ * Decode the JSON blob stored in skills.drafter_meta. Returns null if
+ * the column is empty or unparseable so the SPA can render the
+ * "Drafted by …" line conditionally without crashing on bad data.
+ */
+function parseDrafterMeta(s: string | null): unknown | null {
+  if (!s) return null
+  try {
+    return JSON.parse(s)
+  } catch {
+    return null
+  }
+}

@@ -1,0 +1,161 @@
+/**
+ * Shared helpers for the raw-fetch git providers (github / gitlab / azure):
+ * URL/path encoding, prefix filtering, base64 codec, and the one HTTP
+ * `providerCall` used by every provider impl.
+ */
+
+import {
+  fetchWithSafeRedirects,
+  readTextCapped,
+  ResponseTooLargeError
+} from '../util/safe-fetch'
+
+/** Markdown file extensions we mirror. */
+export const MD_RE = /\.(md|mdown|markdown|mkd)$/i
+
+/**
+ * Per-response byte cap on git-provider reads. Generous — recursive tree
+ * listings for large repos are the biggest legitimate payload — but bounded,
+ * where `await res.text()` previously buffered without limit. The upstream
+ * MCP proxy's equivalent is `UPSTREAM_MAX_RESPONSE_BYTES` (256 KiB); git
+ * mirrors whole files + trees, hence the larger budget.
+ */
+export const GIT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+
+export interface CallResult {
+  status: number
+  json: unknown
+}
+
+export interface ProviderCallInput {
+  /** Log prefix + error-code prefix (`<provider>_api_error:<status>`). */
+  provider: string
+  method: string
+  /** Fully built URL — the caller appends provider quirks (e.g. ADO's
+   * api-version query suffix) before handing it over. */
+  url: string
+  headers: HeadersInit
+  body?: unknown
+  /** Non-2xx statuses to return instead of throw (e.g. 404 probes). */
+  allow?: number[]
+  /** Extra non-secret detail appended to the error log line (e.g. the
+   * provider's `message` field, github's SSO/permission hint headers).
+   * MUST only surface known-safe fields — never the body wholesale. */
+  errorDetail?: (json: unknown, res: Response) => string
+}
+
+/**
+ * A 2xx-but-not-really response that is actually an auth challenge. Azure
+ * DevOps answers a wrong-audience / expired bearer token with `203
+ * Non-Authoritative Information` + an HTML sign-in page instead of `401` —
+ * and 203 is `res.ok`, so without this guard the call reads as success with
+ * a null (unparseable-HTML) body, and the caller then throws a misleading
+ * downstream error (e.g. `azure_ref_unresolved` from empty refs) with no log.
+ * Every `providerCall` consumer requests `application/json`, so an ok response
+ * that didn't parse as JSON is never legitimate data.
+ */
+function isAuthInterstitial(res: Response, text: string, json: unknown): boolean {
+  // 203 is unambiguous for ADO here; no git REST API returns it for real data.
+  if (res.status === 203) return true
+  // Belt-and-suspenders for SSO proxies that wrap a 200 around a login page:
+  // only when the body genuinely failed to parse as JSON (never reinterpret a
+  // real payload) and declares/looks like HTML.
+  if (json === null && text) {
+    const ct = res.headers.get('content-type') ?? ''
+    if (/text\/html/i.test(ct) || /<html|<!doctype html/i.test(text)) return true
+  }
+  return false
+}
+
+/**
+ * fetch + JSON-parse-or-null + allow-listed statuses. On a non-allowed
+ * failure, logs `provider: METHOD url -> status` (+ errorDetail) — never
+ * the response body, which can carry tokens or internal detail — and
+ * throws the generic `<provider>_api_error:<status>` code. A 2xx auth
+ * interstitial (see `isAuthInterstitial`) throws `<provider>_auth_failed`.
+ */
+export async function providerCall(input: ProviderCallInput): Promise<CallResult> {
+  const init: RequestInit = { method: input.method, headers: input.headers }
+  if (input.body !== undefined) init.body = JSON.stringify(input.body)
+  // Manual redirect-following re-asserts the https check per hop and strips
+  // the PAT when a hop leaves the provider's origin; the capped read bounds
+  // worker memory against a huge blob/tree response.
+  const res = await fetchWithSafeRedirects(input.url, init, input.provider)
+  let text: string
+  try {
+    text = await readTextCapped(res, GIT_MAX_RESPONSE_BYTES, input.provider)
+  } catch (err) {
+    if (err instanceof ResponseTooLargeError) {
+      console.error(
+        `${input.provider}: ${input.method} ${input.url} -> response exceeded ${GIT_MAX_RESPONSE_BYTES} bytes`
+      )
+      throw new Error(`${input.provider}_response_too_large`)
+    }
+    throw err
+  }
+  let json: unknown = null
+  if (text) {
+    try {
+      json = JSON.parse(text)
+    } catch {
+      json = null
+    }
+  }
+  if (isAuthInterstitial(res, text, json)) {
+    // Log status only — the HTML body can carry sign-in URLs / correlation ids.
+    console.error(
+      `${input.provider}: ${input.method} ${input.url} -> ${res.status} auth_interstitial (wrong token audience or scope?)`
+    )
+    throw new Error(`${input.provider}_auth_failed`)
+  }
+  if (!res.ok && !(input.allow ?? []).includes(res.status)) {
+    const detail = input.errorDetail ? input.errorDetail(json, res) : ''
+    console.error(`${input.provider}: ${input.method} ${input.url} -> ${res.status}${detail}`)
+    throw new Error(`${input.provider}_api_error:${res.status}`)
+  }
+  return { status: res.status, json }
+}
+
+/** The provider's non-secret `message` field (gitlab also uses `error`). */
+export function jsonMessage(json: unknown, fallbackKey?: 'error'): string {
+  const body = json as { message?: unknown; error?: unknown } | null
+  if (typeof body?.message === 'string') return body.message
+  if (fallbackKey && typeof body?.[fallbackKey] === 'string') return body[fallbackKey] as string
+  return ''
+}
+
+export function asObj(v: unknown): Record<string, unknown> {
+  return v && typeof v === 'object' ? (v as Record<string, unknown>) : {}
+}
+
+export function enc(s: string): string {
+  return encodeURIComponent(s)
+}
+
+/** Encode a repo path, preserving '/' separators. */
+export function encPath(p: string): string {
+  return p.split('/').map(encodeURIComponent).join('/')
+}
+
+export function normalizePrefix(prefix: string): string {
+  return prefix.replace(/^\/+|\/+$/g, '')
+}
+
+export function underPrefix(path: string, prefix: string): boolean {
+  if (!prefix) return true
+  return path === prefix || path.startsWith(`${prefix}/`)
+}
+
+export function toBase64(text: string): string {
+  const bytes = new TextEncoder().encode(text)
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin)
+}
+
+export function fromBase64(b64: string): string {
+  const bin = atob(b64.replace(/\s/g, ''))
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return new TextDecoder().decode(bytes)
+}

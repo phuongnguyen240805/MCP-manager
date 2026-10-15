@@ -1,0 +1,266 @@
+/**
+ * User-facing git endpoints:
+ *   GET  /api/docs/:id/git              — per-doc git status (+ live PR poll)
+ *   POST /api/docs/:id/git/pull-request — open/refresh a write-back PR
+ *   PUT  /api/git-sources/:id/credentials    — connect a personal PAT
+ *   DELETE /api/git-sources/:id/credentials  — disconnect
+ *
+ * Write-back is gated by canEditDoc (the doc ACL). Per-user creds are
+ * gated by source visibility (or admin). Never logs token material.
+ */
+
+import { Hono } from 'hono'
+import {
+  CreatePullRequestRequest,
+  GitSetCredentialRequest,
+  type GitDocStatus
+} from '@ctxlayer/shared'
+import type { Env } from '../env'
+import { requireUser, type AuthedVariables } from '../auth/middleware'
+import { requireCsrf } from '../auth/csrf'
+import { auditFromCtx } from '../audit/log'
+import { canEditDoc, getDocById } from '../db/queries/docs'
+import { deleteCollabState, readSourceMarkdown } from '../storage/docs-r2'
+import {
+  deleteGitUserCredential,
+  getDocGitOrigin,
+  getGitSourceById,
+  getGitSourceIfVisible,
+  getGitUserCredential,
+  getLatestPrForDoc,
+  setDocGitSyncState,
+  updateGitPrState,
+  upsertGitUserCredential,
+  type GitSourceRow
+} from '../db/queries/git-sources'
+import { getGitConnectionForSource } from '../db/queries/git-connections'
+import { createGitProvider } from '../git/provider'
+import type { GitFileContent, GitRepoConfig } from '../git/provider-types'
+import { resolveGitReadToken } from '../git/credentials'
+import { importGitFile } from '../git/sync'
+import { openWriteBackPr, prepareWriteBackRedirect } from '../git/writeback'
+import { errMessage } from '../util/errors'
+import { htmlRoundtripUnsafe } from '../git/html-guard'
+import { gitStaticOAuth } from '../git/git-oauth'
+import { seal } from '../crypto/aead'
+import { notFound, parseJsonBody } from './respond'
+
+function repoConfig(s: GitSourceRow): GitRepoConfig {
+  return {
+    provider: s.provider,
+    baseUrl: s.base_url,
+    owner: s.owner,
+    project: s.project,
+    repo: s.repo
+  }
+}
+
+// ----- doc-scoped (/api/docs) --------------------------------------------
+
+export const gitDocsRoute = new Hono<{ Bindings: Env; Variables: AuthedVariables }>()
+gitDocsRoute.use('*', requireUser)
+gitDocsRoute.use('*', requireCsrf)
+
+gitDocsRoute.get('/:id/git', async (c) => {
+  const id = c.req.param('id')
+  const origin = await getDocGitOrigin(c.env, id)
+  if (!origin) return c.json({ error: 'not_a_git_doc' }, 404)
+  const source = await getGitSourceById(c.env, origin.git_source_id)
+  if (!source) return c.json({ error: 'source_gone' }, 404)
+
+  const userId = c.get('user').userId
+  const canWrite = await canEditDoc(c.env, userId, id)
+  const webUrl = createGitProvider(repoConfig(source), '').blobWebUrl(
+    origin.git_path,
+    source.branch
+  )
+
+  let syncState = origin.git_sync_state
+  const latest = await getLatestPrForDoc(c.env, id)
+  let pr = latest
+    ? { url: latest.url, providerPrId: latest.provider_pr_id, state: latest.state }
+    : null
+
+  // Best-effort live refresh while a PR is open (no webhooks).
+  if (latest && latest.state === 'open') {
+    const token = await resolveGitReadToken(c.env, source, { userId })
+    if (token) {
+      try {
+        const live = await createGitProvider(repoConfig(source), token).getPullRequestState(
+          latest.provider_pr_id
+        )
+        if (live !== latest.state) {
+          await updateGitPrState(c.env, latest.id, live)
+          pr = { url: latest.url, providerPrId: latest.provider_pr_id, state: live }
+          if (live === 'merged' || live === 'closed') {
+            await setDocGitSyncState(c.env, id, 'clean')
+            syncState = 'clean'
+          }
+        }
+      } catch {
+        // keep the stored state on a poll failure
+      }
+    }
+  }
+
+  // Auth (OAuth client config + write strategy) lives on the connection now;
+  // currentUserConnected = the caller has their own sealed token on it. These
+  // drive the editor rail's "smart connect" (show Connect only when needed).
+  const connection = await getGitConnectionForSource(c.env, source.id)
+  const userCred = await getGitUserCredential(c.env, userId, source.id)
+  // Block write-back when the source carries HTML the editor can't round-trip
+  // (it's dropped on parse, so a PR would commit it away). Read source.md only
+  // when the user could otherwise write — viewers don't need the flag.
+  const htmlUnsafe = canWrite ? htmlRoundtripUnsafe((await readSourceMarkdown(c.env, id)) ?? '') : false
+  const body: GitDocStatus = {
+    gitSourceId: source.id,
+    sourceSlug: source.slug,
+    provider: source.provider,
+    branch: source.branch,
+    path: origin.git_path,
+    webUrl,
+    syncState,
+    syncedAt: origin.git_synced_at,
+    canWrite,
+    // The SOURCE's strategy is what write-back actually uses (see
+    // git/credentials.ts) — the connection's copy is only the attach-time
+    // default and can be stale after a per-repo PATCH. Reporting the
+    // connection copy here made the rail's "smart connect" disagree with
+    // real write behaviour.
+    writeStrategy: source.write_strategy,
+    currentUserConnected: userCred !== null,
+    oauthConfigured: gitStaticOAuth(connection?.auth_config ?? null) !== null,
+    htmlRoundtripUnsafe: htmlUnsafe,
+    pr
+  }
+  return c.json(body)
+})
+
+/**
+ * Revert a git doc to the repo's current version — discard local edits.
+ * Re-imports the file at the branch head and DROPS the doc's collab state
+ * (Yjs binary + materialised snapshot), so the editor, MCP get_doc, and
+ * search all read the fresh source.md. Deliberately does NOT touch an
+ * open PR — if the local edits were pushed, abandon that in the provider
+ * first (the rail shows it). canEditDoc-gated: reverting destroys content
+ * exactly like editing does; revision history stays for recovery.
+ */
+gitDocsRoute.post('/:id/git/revert', async (c) => {
+  const id = c.req.param('id')
+  const userId = c.get('user').userId
+  if (!(await canEditDoc(c.env, userId, id))) return c.json({ error: 'forbidden' }, 403)
+  const origin = await getDocGitOrigin(c.env, id)
+  if (!origin) return c.json({ error: 'not_a_git_doc' }, 404)
+  const source = await getGitSourceById(c.env, origin.git_source_id)
+  if (!source) return c.json({ error: 'source_gone' }, 404)
+  const token = await resolveGitReadToken(c.env, source, { userId })
+  if (!token) return c.json({ error: 'no_read_token' }, 400)
+
+  const provider = createGitProvider(repoConfig(source), token)
+  let file: GitFileContent
+  let headSha: string
+  try {
+    const branch = source.branch.trim() || (await provider.getDefaultBranch()) || ''
+    if (!branch) throw new Error('repo_no_default_branch')
+    headSha = await provider.resolveRef(branch)
+    file = await provider.readFile(origin.git_path, branch)
+  } catch (err) {
+    // Generic code to the caller; the real detail is server-side only
+    // (provider errors can carry hostnames/status bodies).
+    console.error(`[git-revert] ${source.slug} ${origin.git_path}: ${errMessage(err)}`)
+    return c.json({ error: 'git_fetch_failed' }, 502)
+  }
+
+  // Drop live collab state FIRST (a live DO would rewrite the snapshots
+  // from memory), then the stored artifacts, then re-import.
+  const stub = c.env.DOC_ROOM_DO.get(c.env.DOC_ROOM_DO.idFromName(id))
+  await stub.fetch('https://doc-room/reset-content', { method: 'POST' })
+  await deleteCollabState(c.env, id)
+  await importGitFile(
+    c.env,
+    source,
+    { path: origin.git_path, text: file.text, blobSha: file.blobSha },
+    headSha,
+    id
+  )
+  await auditFromCtx(c, 'doc.git_revert', id, { slug: source.slug, path: origin.git_path })
+  return c.json({ reverted: true })
+})
+
+// Canonical raw markdown for a git doc — the editor parses this into
+// BlockNote blocks lazily on first open (no server-side md→blocks).
+// Open-read like all docs.
+gitDocsRoute.get('/:id/git/source', async (c) => {
+  const id = c.req.param('id')
+  if (!(await getDocById(c.env, id))) return notFound(c)
+  const origin = await getDocGitOrigin(c.env, id)
+  if (!origin) return c.json({ error: 'not_a_git_doc' }, 404)
+  const markdown = (await readSourceMarkdown(c.env, id)) ?? ''
+  return c.json({ markdown })
+})
+
+gitDocsRoute.post('/:id/git/pull-request', async (c) => {
+  const id = c.req.param('id')
+  const userId = c.get('user').userId
+  if (!(await canEditDoc(c.env, userId, id))) return c.json({ error: 'forbidden' }, 403)
+  const parsed = await parseJsonBody(c, CreatePullRequestRequest)
+  if (!parsed.ok) return parsed.res
+  const outcome = await openWriteBackPr(c.env, id, {
+    actorId: userId,
+    markdown: parsed.data.markdown
+  })
+  if (!outcome.ok) return c.json({ error: outcome.error }, outcome.status as 400 | 404 | 422 | 502)
+  return c.json(outcome.result)
+})
+
+// Commit the branch, then return the provider's New-PR deep-link for the user
+// to review + open in the provider UI (no PR opened by us, no local mutation).
+gitDocsRoute.post('/:id/git/review-url', async (c) => {
+  const id = c.req.param('id')
+  const userId = c.get('user').userId
+  if (!(await canEditDoc(c.env, userId, id))) return c.json({ error: 'forbidden' }, 403)
+  const parsed = await parseJsonBody(c, CreatePullRequestRequest)
+  if (!parsed.ok) return parsed.res
+  const outcome = await prepareWriteBackRedirect(c.env, id, {
+    actorId: userId,
+    markdown: parsed.data.markdown
+  })
+  if (!outcome.ok) return c.json({ error: outcome.error }, outcome.status as 400 | 404 | 422 | 502)
+  return c.json(outcome.result)
+})
+
+// ----- per-user credentials (/api/git-sources) ---------------------------
+
+export const gitSourcesUserRoute = new Hono<{ Bindings: Env; Variables: AuthedVariables }>()
+gitSourcesUserRoute.use('*', requireUser)
+gitSourcesUserRoute.use('*', requireCsrf)
+
+gitSourcesUserRoute.put('/:id/credentials', async (c) => {
+  const id = c.req.param('id')
+  const actor = c.get('user')
+  const access = await getGitSourceIfVisible(c.env, id, actor)
+  if (!access.ok) {
+    return access.reason === 'not_found' ? notFound(c) : c.json({ error: 'forbidden' }, 403)
+  }
+  const parsed = await parseJsonBody(c, GitSetCredentialRequest)
+  if (!parsed.ok) return parsed.res
+  const sealed = await seal(parsed.data.token, c.env.ENCRYPTION_KEY)
+  await upsertGitUserCredential(c.env, actor.userId, id, {
+    kind: 'bearer',
+    ciphertext: sealed.ciphertext,
+    iv: sealed.iv,
+    keyVersion: sealed.keyVersion
+  })
+  // Mirrors the admin trail (git_source.shared_token_set) for the
+  // self-service PAT path, which was silent.
+  await auditFromCtx(c, 'git_credential.set', id, { slug: access.source.slug, scope: 'user' })
+  return new Response(null, { status: 204 })
+})
+
+gitSourcesUserRoute.delete('/:id/credentials', async (c) => {
+  const actor = c.get('user')
+  const id = c.req.param('id')
+  await deleteGitUserCredential(c.env, actor.userId, id)
+  await auditFromCtx(c, 'git_credential.revoke', id, { scope: 'user' })
+  return new Response(null, { status: 204 })
+})
