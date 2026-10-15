@@ -28,7 +28,7 @@ function clientWith(listTools: UpstreamClient['listTools']): UpstreamClient {
   return { listTools, callTool: vi.fn(async () => ({ content: [] })), close: async () => {} }
 }
 
-function registry(client: UpstreamClient): UpstreamProxyRegistry {
+function registry(client: UpstreamClient, budgetMs = BUDGET_MS): UpstreamProxyRegistry {
   return new UpstreamProxyRegistry(
     testEnv,
     'u-1',
@@ -36,7 +36,7 @@ function registry(client: UpstreamClient): UpstreamProxyRegistry {
     'sess-1',
     () => client,
     inMemoryHintLedger(),
-    BUDGET_MS
+    budgetMs
   )
 }
 
@@ -111,7 +111,10 @@ describe('UpstreamProxyRegistry stale-catalogue budget (real D1)', () => {
     )
     const server = fakeServer()
 
-    await registry(quick).init(server as unknown as McpServer)
+    // The refresh includes real D1 writes, which can exceed 50ms under a
+    // loaded test runner. Give the successful path time to finish so its
+    // background writes cannot leak into the following test's fixture.
+    await registry(quick, 2_000).init(server as unknown as McpServer)
 
     expect(registeredNames(server)).toEqual(['up-budget__alpha', 'up-budget__gamma'])
   })

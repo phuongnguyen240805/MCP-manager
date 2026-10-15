@@ -74,6 +74,39 @@ for (const c of checks) {
     const ok = c.expect.includes(res.status)
     rows.push({ name: c.name, ok, status: res.status, ms })
     if (!ok) failed++
+    // SPA fallback can return 200 HTML for missing JS/CSS. Check the actual
+    // entry assets so a stale dev asset manifest cannot pass as a healthy UI.
+    if (c.name === 'spa-shell' && ok) {
+      const html = await res.text()
+      const assets = [
+        ...html.matchAll(/<script\b[^>]*\bsrc="([^"]+)"/g),
+        ...html.matchAll(/<link\b[^>]*\brel="stylesheet"[^>]*\bhref="([^"]+)"/g)
+      ].map((match) => match[1])
+      if (assets.length === 0) {
+        rows.push({ name: 'spa-assets', ok: false, status: 'MISSING', ms: 0 })
+        failed++
+      }
+      for (const asset of assets) {
+        const assetUrl = new URL(asset, base)
+        if (assetUrl.origin !== new URL(base).origin) continue
+        const assetStart = Date.now()
+        const assetRes = await fetch(assetUrl, tlsExtra)
+        const contentType = assetRes.headers.get('content-type') ?? ''
+        const assetOk = assetRes.ok &&
+          (/\.css$/.test(assetUrl.pathname)
+            ? contentType.includes('text/css')
+            : /(?:java|ecma)script/.test(contentType))
+        rows.push({
+          name: /\.css$/.test(assetUrl.pathname) ? 'spa-css' : 'spa-js',
+          ok: assetOk,
+          status: assetRes.status,
+          ms: Date.now() - assetStart,
+          error: assetOk ? undefined : `unexpected asset content-type: ${contentType}`
+        })
+        await assetRes.body?.cancel()
+        if (!assetOk) failed++
+      }
+    }
   } catch (err) {
     rows.push({
       name: c.name,

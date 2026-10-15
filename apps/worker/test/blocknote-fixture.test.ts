@@ -35,7 +35,10 @@ const DIR = join(__dirname, 'fixtures', 'blocknote-0.51')
 const fixture = JSON.parse(readFileSync(join(DIR, 'content.json'), 'utf8')) as {
   blocks: unknown[]
 }
-const expected = readFileSync(join(DIR, 'expected.md'), 'utf8').replace(/\n$/, '')
+// Git may check out this text fixture with CRLF on Windows.
+const expected = readFileSync(join(DIR, 'expected.md'), 'utf8')
+  .replace(/\r\n/g, '\n')
+  .replace(/\n$/, '')
 
 describe('BlockNote 0.51 fixture cross-check', () => {
   it('the server renderer reproduces the pinned markdown byte-for-byte', () => {
