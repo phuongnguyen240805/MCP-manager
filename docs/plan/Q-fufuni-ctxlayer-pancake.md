@@ -518,3 +518,13 @@ rtk proxy node scripts/probe-ctxlayer-local.mjs https://localhost:8787
 - Thay đổi Fufuni được giữ trong working tree để không gom các file nền chưa commit
   của người dùng vào một PR không thể review. Bản đối chiếu trước khi sửa nằm ở
   `C:/Users/ADMIN/AppData/Local/Temp/kedi-sync-baseline-20261016/fufuni`.
+- Nhánh Fufuni: `codex/ctxlayer-catalog-sync`; bản patch chỉ phần tích hợp so với
+  baseline hiện có: `C:/Users/ADMIN/AppData/Local/Temp/kedi-sync-baseline-20261016/fufuni/fufuni-agent-changes.patch`.
+  Patch này cần nền working tree trước tác vụ, không áp dụng riêng lên Git main sạch.
+- Pancake MCP đã commit `ebb7071` trên `codex/catalog-snapshot-tool`. Push bị GitHub
+  từ chối HTTP 403: tài khoản `phuongnguyen240805` chưa có quyền ghi repo
+  `nguyennguyenit/pancake-pos-mcp`. Commit và code local vẫn còn nguyên; chưa có PR
+  Pancake, không tự đổi remote hoặc dùng tài khoản khác.
+- Gateway/report: [PR #6](https://github.com/phuongnguyen240805/MCP-manager/pull/6),
+  stacked trên plan PR #5. PR này chỉ chứa thay đổi trong ctxlayer; backend Fufuni
+  và tool Pancake phải được bàn giao cùng để chạy luồng mới.
