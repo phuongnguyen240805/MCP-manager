@@ -1,341 +1,414 @@
-# Fufuni → ctxlayer → Pancake MCP: kế hoạch nghiệm thu local
+# Đồng bộ catalog: Fufuni → ctxlayer → Pancake MCP → database → Halifruit
 
-Ngày: 2026-10-16. Trạng thái: kế hoạch, chưa triển khai các module đề xuất.
-Tiếp nối [kế hoạch KEDI](P-kedi-mcp-hub.md). Chỉ local, chưa deploy Cloudflare thật.
+Ngày cập nhật: 2026-10-16. Trạng thái: kế hoạch, chưa triển khai module mới.
+Tiếp nối [KEDI Hub](P-kedi-mcp-hub.md). Phạm vi local, chưa deploy Cloudflare thật.
 
-## 1. Mục tiêu và phạm vi
+## 1. Mục tiêu đã chốt
 
-Xây MCP client trong backend Fufuni để nhân viên Halifruit liên kết tài khoản
-ctxlayer và xem tối đa 5 đơn Pancake qua Gateway. Phải chứng minh lời gọi thực
-sự đi qua ctxlayer, bị chặn khi Gateway OFF/thu hồi quyền, không có fallback
-sang API Pancake trực tiếp.
-
-MVP chỉ có `manage_orders` / `list`, kết quả compact và trường hiển thị tối thiểu.
-Không tạo/sửa/xóa đơn, không thay checkout, cron đồng bộ hoặc ledger POS hiện có.
-Không cần LLM, R2 hay một MCP server mới trong Fufuni cho luồng thử này.
-Phê duyệt thao tác ghi là phase riêng sau khi read-only đạt.
-
-Đầu ra nghiệm thu:
-
-- Nhân viên bấm Kết nối ctxlayer, đăng nhập/cấp quyền và trở lại trang thử.
-- Backend giữ token riêng theo store + danh tính nhân viên, trình duyệt không nhận token MCP.
-- Bấm Xem 5 đơn → Fufuni gọi MCP tool qua Gateway → DTO đơn đã lọc.
-- Nhân viên khác không sử dụng được kết nối hoặc kết quả của người trước.
-- Gateway OFF/quyền bị thu hồi làm lần đọc tiếp theo thất bại, không gọi Pancake trực tiếp.
-- Disconnect, expiry/refresh và reconnect có hành vi kiểm thử được.
-
-## 2. Hiện trạng đã kiểm tra
-
-| Thành phần | Source thực tế | Nhận định |
-|---|---|---|
-| Halifruit FE/BFF | `D:/workspace/halifruit-fe-v1/src/lib/fufuni/server-client.ts` | Next.js gọi Fufuni bằng server fetch/service binding; hỗ trợ public/admin key, chưa có MCP client |
-| Backend Fufuni | `D:/monorepo-project-workspace/fufuni/apps/merchant/src/index.ts` | OpenAPIHono, Worker; đây là nơi đặt MCP client |
-| Auth Fufuni | `src/middleware/auth.ts`, `src/types.ts` | Có Auth0 JWT/API key; AuthContext có `sub`, nhưng không được giả định mọi đường auth đã điền subject |
-| Database Fufuni | `src/db.ts`, `src/do.ts` | `getDb()` đi qua MerchantDO SQLite; không tự thêm D1 cho tích hợp |
-| Pancake hiện có | `src/routes/pancake.ts`, `lib/pancake-sync.ts`, `lib/commerce-pos.ts` | Đồng bộ và tạo đơn bằng API trực tiếp đã tồn tại; giữ riêng với chức năng thử MCP |
-| ctxlayer | `apps/worker/src/oauth/provider-config.ts` | OAuth endpoints authorize/token/register, scope `mcp`; không có bằng chứng hỗ trợ client_credentials cho MVP |
-| Gateway proxy | `apps/worker/src/mcp/`, `src/policy/` | Có adapter HTTP, live authorization và operation approval |
-| Catalog Pancake | Người dùng đã refresh thành công 24 tool | Chứng minh MCP discovery, chưa chứng minh API key đọc được đơn của shop |
-
-Fufuni đang có nhiều thay đổi chưa commit. Khi triển khai phải ghi baseline,
-chỉ sửa file liên quan, không reset/stash/stage toàn bộ hoặc commit hộ thay đổi khác.
-Repo `fufuni/apps/mcp` có sẵn nhưng không phải nơi đặt client nghiệp vụ này.
-
-## 3. Kiến trúc và workflow
+Người dùng chọn **sản phẩm, biến thể, giá và tồn kho trước**. Fufuni chủ động
+chạy job lấy dữ liệu thông qua ctxlayer, chuẩn hóa và lưu database. Halifruit
+đọc API Fufuni; mở trang không chờ MCP hoặc Pancake hoạt động.
 
 ```text
-Nhân viên đã đăng nhập Halifruit
-  → Next.js BFF: phiên nhân viên + quyền vận hành
-  → Fufuni /v1/integrations/ctxlayer/*: xác thực actor/store
-  → OAuth token của chính actor trong MerchantDO, mã hóa
-  → MCP Client + Streamable HTTP
-  → https://localhost:8787/mcp
-  → live visibility / ACL / action / project checks
-  → up-pancake-pos__manage_orders, action=list
-  → Pancake MCP http://127.0.0.1:3000/mcp
-  → Pancake POS API (hoặc fixture ở bộ offline)
+Cron hoặc admin bấm Đồng bộ trong Fufuni
+  → job theo store/shop/kho, lấy lease
+  → MCP client trong Fufuni
+  → ctxlayer: kiểm tra quyền integration principal
+  → pancake-pos-mcp
+  → Pancake POS API
+  ← dữ liệu phân trang trả qua MCP/Gateway
+  → xác minh đủ snapshot, chuẩn hóa theo model Fufuni
+  → commit atomically vào MerchantDO SQLite
+  → cập nhật sync status + invalidation cache
+
+Halifruit → API catalog/inventory Fufuni → dữ liệu đã lưu
 ```
 
-Tên tool trên Gateway phải xác minh bằng `tools/list`; tên trên là kỳ vọng
-theo slug hiện dùng. Không lấy tool name/URL/args tùy ý từ trình duyệt.
-Danh tính Halifruit và ctxlayer có thể khác subject; liên kết chỉ được thiết lập
-sau OAuth callback thành công, không ghép bằng email do client gửi.
+MVP không có read-through MCP trong request storefront, không kết nối OAuth cho
+từng khách mua hàng, không lấy đơn hàng/khách hàng và không ghi ngược Pancake.
+Job định kỳ dùng connection tích hợp của store, tách khỏi phiên người xem Halifruit.
+Đây là thiết kế thay thế bản trước vốn tập trung đọc 5 đơn trực tiếp.
 
-### Kết nối OAuth
+Mục tiêu nghiệm thu:
 
-1. BFF xác thực nhân viên; Fufuni kiểm tra quyền admin/staff được cấp cho chức năng này.
-2. Fufuni khám phá protected-resource và authorization-server metadata từ issuer
-   đã cấu hình. Chỉ chấp nhận endpoints thuộc allowlist cấu hình tin cậy.
-3. Đăng ký OAuth client bằng DCR khi chưa có; lưu registration theo issuer/store,
-   không tạo client mới mỗi lần click. Khóa redirect URI cố định.
-4. Sinh state, PKCE S256, nonce giao dịch nội bộ; lưu verifier mã hóa, store/actor,
-   browser-binding hash, expiry 10 phút. Không dùng một biến OAuth toàn cục.
-5. BFF đặt cookie giao dịch HttpOnly, SameSite=Lax; browser redirect sang ctxlayer.
-6. ctxlayer đăng nhập/consent → callback BFF. BFF chuyển code/state/binding qua
-   server request được xác thực đến Fufuni. Callback là GET chỉ dùng kết thúc OAuth.
-7. Fufuni kiểm tra state một lần, expiry, store/actor/browser binding, issuer và
-   redirect URI trước exchange. Gửi resource/scope theo metadata và SDK hỗ trợ.
-8. Lưu token mã hóa; xóa state/cookie trên mọi đường hoàn thành, kể cả deny/error.
-   Redirect về một đường dẫn nội bộ cố định, không nhận return URL tùy ý.
+- Đồng bộ thử một sản phẩm qua Gateway, đọc lại từ database/API Fufuni.
+- Chạy lại không trùng sản phẩm/biến thể; giá VND và tồn đúng kho.
+- Full snapshot hợp lệ cập nhật danh mục; lỗi giữa chừng giữ snapshot trước.
+- Tắt Gateway/thu hồi quyền chặn job mới, nhưng Halifruit vẫn đọc dữ liệu đã commit
+  theo chính sách độ mới của giá/tồn; không tự quay về API Pancake trực tiếp.
+- Hai store/shop không dùng chung connection, mapping hoặc trạng thái job.
+- Báo cáo có run ID, thời điểm thành công, số bản ghi/warnings và lỗi ổn định.
 
-MCP authorization dùng OAuth + PKCE theo [đặc tả chính thức](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization).
-Dùng API của [TypeScript SDK v1](https://ts.sdk.modelcontextprotocol.io/client)
-phù hợp các server đang ghim v1; kiểm tra phiên bản cụ thể trước khi thêm dependency.
-Không trộn ví dụ SDK v2 vào code v1 và không tự viết JSON-RPC bằng fetch ad hoc.
+## 2. Hiện trạng và hướng tái sử dụng
 
-### Đọc đơn và disconnect
+| Thành phần thực tế | Vai trò |
+|---|---|
+| `fufuni/apps/merchant/src/lib/pancake-sync.ts` | Đã có runner sync, lease, normalize, apply snapshot, cache invalidation |
+| `lib/pancake-source.ts` | Đọc REST trực tiếp và model/normalizer; cần tách transport khỏi normalization |
+| `lib/pancake-store.ts`, `src/do.ts` | Mapping stable IDs, DO transaction, inventory/reservation và báo cáo |
+| `src/routes/pancake.ts` | Admin status/sync đã có; tái sử dụng thay vì tạo luồng sync cạnh tranh |
+| `src/index.ts` scheduled handler | Chạy theo store registry; tích hợp job với cùng orchestrator |
+| `lib/stores.ts` | Resolve store/env và MerchantDO; thêm cấu hình MCP theo store |
+| `lib/commerce-pos.ts` | Luồng ghi đơn Pancake riêng, ngoài phạm vi thay đổi |
+| `halifruit-fe-v1/src/lib/fufuni/server-client.ts` | Đã đọc catalog/inventory qua API Fufuni; giữ đường dữ liệu này |
+| `ctxlayer/src` trong các workspace worker/shared/web | Proxy, invocation policy, credential và approval hiện có |
 
-1. Fufuni kiểm tra feature flag, actor/store và connection active.
-2. Lấy token; refresh khi cần với cơ chế một refresh đang chạy cho mỗi connection.
-   Commit token mới bằng version CAS, không ghi đè refresh token vừa được rotate.
-3. Khởi tạo MCP Client, initialize, lấy catalog có giới hạn/phân trang, xác minh tool/schema.
-4. Gọi tool đã allowlist với `action=list`, `page_size<=5`, `verbosity=compact`.
-   Kiểm tra tên trường thực tế trong catalog Pancake trước khi chốt payload.
-5. Parse content/structuredContent qua schema adapter; MCP `isError` phải coi là lỗi.
-6. Chỉ trả ID/mã đơn, thời điểm, trạng thái, tổng tiền; không trả nguyên object
-   khách hàng, điện thoại, địa chỉ, editor_id/creator_id hoặc upstream error body.
-7. Đóng client/transport trong finally; MVP không pool chung client giữa nhân viên.
-8. Disconnect tăng connection version, vô hiệu token local, xóa giao dịch chờ;
-   thử revoke tại issuer nếu được hỗ trợ. Trạng thái remote revoke phải báo đúng.
-   Response đang chạy chỉ được trả nếu connection version vẫn active khi hoàn tất.
+Source backend: `D:/monorepo-project-workspace/fufuni/apps/merchant`.
+FE/BFF: `D:/workspace/halifruit-fe-v1`. Gateway: repo ctxlayer hiện tại.
+`fufuni/apps/mcp` không phải nơi đặt MCP client nghiệp vụ.
 
-Không cache dữ liệu đơn trong MVP; tất cả response chức năng này dùng no-store.
-401 sau refresh lỗi → reconnect; 403 → báo thiếu quyền; timeout/429 → mã lỗi ổn định.
-Không retry vô hạn; tối đa một refresh/retry auth cho thao tác đọc, tôn trọng deadline.
-Không đổi mọi lỗi thành “token sai”. Không replay một thao tác ghi trong tương lai.
+Giữ normalizer, stable ID và DO commit hiện có khi hợp đồng dữ liệu tương thích.
+Thêm `CatalogSource` với hai implementation rõ ràng `direct` và `ctxlayer_mcp`.
+Một store chỉ chọn **một source cho mỗi run**, cả manual và cron dùng chung.
+Mode MCP fail phải báo lỗi, tuyệt đối không fallback direct hoặc chạy hai job
+cùng ghi catalog. Chuyển source bằng cấu hình có audit, không bằng catch lỗi.
 
-## 4. Ranh giới xác thực bắt buộc
+Không mở rộng âm thầm giới hạn snapshot hiện có (20 trang × 30 biến thể, 600).
+Vượt giới hạn phải lỗi rõ; phase mở rộng dùng staging/versioned snapshot riêng.
+Fufuni/Halifruit đang có thay đổi chưa commit: giữ baseline và chỉ commit phần
+thuộc tích hợp, không reset/stash/stage toàn bộ thay đổi sẵn có.
 
-- `FUFUNI_ADMIN_KEY` là quyền backend, không tự chứng minh người dùng nào đang gọi.
-- Phase 0 phải kiểm tra Halifruit đang dùng Auth0 JWT hay phiên nội bộ. Phương án
-  mặc định: forward JWT nhân viên đã verify issuer/audience/permission/store và giữ
-  subject ổn định. Có thể gọi Fufuni trực tiếp để probe nếu JWT hiện có phù hợp.
-- Nếu Halifruit không có JWT đó: thêm assertion BFF được ký, TTL ngắn, aud riêng,
-  subject lấy từ phiên đã verify; Fufuni xác minh chữ ký/issuer/aud/store và chống replay
-  ở request nhạy cảm. Đây là phần triển khai cần thiết, không thay bằng `X-User-Id`
-  hoặc dùng chung admin key kèm email do client gửi.
-- Binding browser và kết quả connect chỉ thuộc actor đã bắt đầu transaction.
-- Feature thử chỉ mở cho nhân viên có quyền. Public/customer key không được gọi.
-- CSRF/Origin protection cho BFF mutation dùng cookie; endpoint bearer-only phía
-  Fufuni vẫn kiểm tra auth và không nhận credential từ query string.
-- Không dùng token Pancake MCP, Pancake API key, Fufuni admin key thay OAuth token ctxlayer.
-- Không thêm bypass auth, token tự ký giả làm access token ctxlayer, hay client_credentials
-  khi chưa có hỗ trợ và bài kiểm chứng từ Gateway.
+## 3. Hợp đồng MCP là gate đầu tiên
 
-## 5. Endpoint đề xuất
+24 cached tools chỉ chứng minh discovery. Phải xác minh tools/action/schema và
+đủ trường để tái tạo snapshot của normalizer Fufuni.
 
-Prefix Fufuni: `/v1/integrations/ctxlayer`. Mount tách khỏi `/integrations/pancake` hiện có.
+| Nhu cầu | Công cụ/action ứng viên cần xác minh |
+|---|---|
+| Shop cố định của connection | Metadata shop đã cấu hình hoặc `get_shop_info` / `get` |
+| Kho và khả năng dùng kho | `manage_warehouses` / `list`, `get` |
+| Sản phẩm | `manage_products` / `list`, `get` |
+| Biến thể, giá, tồn từng kho | `manage_products` / `list_variations` hoặc tool đọc snapshot chuyên biệt |
 
-| Method/path | Hành vi | Quyền |
-|---|---|---|
-| GET `/status` | disconnected/connecting/connected/reauth_required; không có token | Actor nhân viên hiện hành |
-| POST `/connect` | Tạo giao dịch, trả authorization URL + opaque transaction ID | Actor + browser binding |
-| POST `/complete` | BFF hoàn tất code/state exchange server-to-server | Actor + binding + one-time state |
-| DELETE `/connection` | Disconnect connection của actor hiện hành | Actor + mutation protection |
-| GET `/pancake/orders?limit=5` | Gọi đúng tool/action read-only, trả DTO allowlist | Actor + connection của store |
+Source đã kiểm tra: `manage_products/list_variations` hiện yêu cầu product_id;
+không giả định tồn tại endpoint tool “liệt kê mọi biến thể” tương đương REST
+`products/variations`. Kiểm tra pagination và consistency của từng action thực tế.
 
-BFF nhận browser callback tại `/api/integrations/ctxlayer/callback`; các BFF handler
-khác mirror status/connect/disconnect/orders và dùng cùng schema. Callback public về
-network nhưng phải kiểm tra phiên/binding/state; không mang Fufuni admin key trên URL.
-Không tạo endpoint “call bất kỳ tool nào” trong MVP.
+Compact masks hiện bỏ images, một số cờ publish/hidden/locked, source SKU và
+currency metadata cần cho normalizer. Không mặc định trường bị bỏ là false/0/null,
+không dùng global stock thay stock kho, không chuyển hàng bị ẩn thành active.
 
-Error codes: `mcp_disabled`, `identity_required`, `mcp_not_connected`,
-`mcp_reauth_required`, `mcp_forbidden`, `mcp_tool_unavailable`, `mcp_schema_changed`,
-`mcp_timeout`, `mcp_rate_limited`, `mcp_upstream_error`, `mcp_invalid_response`.
-Log correlation ID, actor/store, tool, latency và stable code; không log token,
-authorization code, query credential, raw đơn hàng hoặc exchange response body.
+Thứ tự chọn giải pháp:
 
-## 6. Cấu trúc file đề xuất
+1. Dùng tools đọc hiện có nếu response đủ trường và đủ chứng cứ pagination.
+   `verbosity=full` chỉ là probe/adapter input có giới hạn; vẫn phải lọc audit
+   fields có thể chứa credential identifiers trước khi log/lưu/trả ra.
+2. Nếu thiếu: thêm **một tool đọc snapshot catalog** trong Pancake MCP, schema
+   versioned, fields allowlist, page/count metadata và stock theo warehouse.
+   Tool này chỉ đọc API, không thay normalizer Fufuni bằng prompt hay LLM.
+3. Không triển khai commit catalog production-like cho tới khi fixture và schema
+   kiểm chứng đủ shop/kho/variant IDs, SKU, ảnh, giá/currency, trạng thái và tồn.
 
-Tất cả file ghi `[mới]` là đề xuất, chưa được tạo bởi bản kế hoạch này.
+Mọi text từ MCP là input không tin cậy. Parse JSON/schema; xử lý MCP `isError`;
+không eval, không inline vào prompt, không gửi kết quả qua LLM để tiết kiệm token.
+SDK client v1 tương thích server đang ghim v1; version cụ thể chốt sau runtime probe.
+
+## 4. Danh tính job và OAuth tích hợp theo store
+
+Cron không có phiên trình duyệt. Dùng integration principal chuyên dụng trên
+ctxlayer, ví dụ `fufuni-catalog-sync`, active, không cần quyền admin Gateway,
+thuộc Team/Product được giới hạn đúng connection đọc catalog của store.
+
+OAuth của Gateway hiện có authorize/token/register, scope `mcp`; chưa có bằng
+chứng client_credentials. MVP không thêm bypass hay dùng admin session cookie
+của người thao tác làm credential cron.
+
+Workflow provisioning:
+
+1. Admin Fufuni có quyền store bấm Kết nối nguồn catalog; backend tạo transaction
+   state+PKCE S256, bind store/admin/browser, expiry 10 phút, redirect URI cố định.
+2. Người vận hành đăng nhập ctxlayer bằng integration principal và consent.
+3. Callback BFF chuyển code/state/browser-binding server-to-server đến Fufuni.
+4. Backend consume state atomic, xác minh issuer/resource/redirect và exchange.
+5. Lưu encrypted OAuth token bundle theo store+issuer+integration connection.
+   Không trả token cho Halifruit; shared Pancake token và API key không thay token này.
+6. Cron refresh bằng token đã cấp, không cần admin giữ trình duyệt mở.
+7. Grant bị revoke, principal bị khóa hoặc refresh thất bại → pause/reauth_required;
+   admin kết nối lại. Không lấy token từ store khác hay tự đổi principal.
+
+Gate: chứng minh connection thuộc integration principal đã định. Nếu không có
+metadata đáng tin để kiểm tra subject từ token, thêm API identity tối thiểu trên
+Gateway hoặc provisioning assertion có xác thực; không giải mã token opaque để
+đoán subject và không tin email do browser gửi. Grant vẫn có expiry/revocation;
+không gọi đây là machine-to-machine client_credentials.
+
+Admin API tiếp tục dùng auth/permission store hiện có. Admin key dùng chung có
+thể authorize backend operation nhưng không tự chứng minh audit actor con người:
+UI cần verified staff subject; dùng Auth0 JWT hoặc BFF assertion đã verify,
+không nhận `X-User-Id`/email tùy ý. Callback chống CSRF/state replay, cleanup
+mọi nhánh; endpoint return URL và metadata không được trở thành open redirect/SSRF.
+
+Gateway Invocation policy chỉ allow các tool/action đọc cần thiết theo contract
+đã chốt; tất cả write action không có rule thì deny. Connection cố định shop:
+scope account do Pancake MCP giữ; không giả lập shop argument không có trong tool.
+
+## 5. Workflow job và commit
+
+1. Resolve store → source mode → connection generation → shop/warehouse config.
+2. Kiểm tra flags, active connection và limit; manual/cron cùng acquire lease
+   của pipeline Pancake hiện có. Chỉ một run được quyền ghi cho store/shop/kho.
+3. Tạo durable run record: run ID, source/config fingerprint, lease token, thời gian,
+   trigger manual/cron, mode trial/full, state `running`.
+4. MCP initialize/tools discovery có giới hạn; đọc theo trang với timeout/body cap.
+   Mỗi trang validate schema, unique IDs, counts/cursor và warehouse consistency.
+5. Thu thập snapshot theo giới hạn hiện có, không vừa fetch vừa ghi bảng live.
+   Nếu phải kéo dài quá lease, heartbeat có fencing token và deadline; worker cũ
+   không được commit sau khi lease đã mất. MVP không vô hạn resume job dài.
+6. Normalizer tạo product/variant/VND-price/warehouse-stock, stable IDs theo
+   shop+kind+source ID; giữ SKU fallback ổn định và link mapping.
+7. Recheck connection generation/source config/lease và quyền trước commit.
+   Thực hiện check cùng DO transaction ở ranh giới local commit; Gateway vẫn
+   kiểm tra quyền mỗi call. Không hứa atomic revoke giữa hai dịch vụ độc lập.
+8. DO transaction commit snapshot + mappings + run success + snapshot metadata.
+   Trial không retire missing; full chỉ retire absent khi toàn bộ snapshot hợp lệ.
+9. Preserve `reserved` và các field Fufuni sở hữu. Giá VND nguyên không âm;
+   stock đúng warehouse, không âm; fractional stock phải theo quy tắc draft/cảnh báo.
+10. Commit thành công mới invalidate cache catalog/inventory đang phục vụ Halifruit.
+    Cache invalidation lỗi là `succeeded_with_warning`, không rollback catalog đã lưu.
+11. Lỗi fetch/schema/count/auth/commit → run failed/blocked, giữ snapshot trước,
+    lưu stable error và backoff. Không tự đổi zero inventory do network failure.
+
+State: `queued` nếu có dispatcher → `running` → `succeeded` / `succeeded_with_warning`
+/ `failed` / `blocked` / `abandoned`. Claim manual đồng bộ chạy được trước khi thêm
+queue; không trả “queued” nếu chưa persist và chưa có executor đáng tin thực thi.
+Lease timeout khi process chết được phân loại abandoned lúc lần kiểm tra tiếp theo.
+
+MVP full snapshot có giới hạn, không dùng timestamp làm watermark incremental
+khi chưa kiểm chứng updated_at/deletion semantics. Sau này incremental dùng cửa sổ
+overlap, checkpoint sau commit và full reconciliation định kỳ; không advance
+checkpoint khi trang lỗi. Retry bounded cho read transient/429, không retry
+schema/config/permission error liên tục. Job không ghi API Pancake.
+
+## 6. Dữ liệu lưu và API phục vụ
+
+Tái sử dụng bảng commerce product/variant/price/inventory và `pancake_links`.
+Giữ rule ownership: Pancake sở hữu dữ liệu catalog được mapping; Fufuni sở hữu
+reservation/cart/payment. Không dùng upsert để xóa reservation hoặc ghi đè
+metadata thủ công ngoài field map đã xác nhận.
+
+Storage tích hợp trong MerchantDO của store, không thêm R2/D1:
+
+- `ctxlayer_clients`: registration theo issuer+redirect config, secret mã hóa nếu có.
+- `ctxlayer_connections`: integration principal reference, encrypted token bundle,
+  expiry, key version, generation, refresh fencing/version, trạng thái.
+- `ctxlayer_oauth_transactions`: hashed state, admin/browser/store binding,
+  encrypted PKCE verifier, expiry, one-time consume.
+- `pancake_sync_runs`: run/source/config/lease, counts/warnings/error, timestamps.
+- `pancake_sync_state` hiện có: last_success_at, snapshot version, selected source;
+  thay đổi schema additive, migration theo DO lifecycle hiện tại.
+
+AES-GCM random IV, AAD store+connection+issuer, key tách database. Token refresh
+single-flight + CAS; không để request cũ ghi đè refresh token đã rotate.
+
+API quản trị đề xuất (tên/schema chốt khi triển khai):
+
+| API | Vai trò |
+|---|---|
+| `GET /v1/integrations/pancake/status` | Source, connection status, last sync, counts, staleness; không secrets |
+| `POST /v1/integrations/pancake/sync` | Trial/full dùng runner hiện có; auth admin + rate limit |
+| `GET /v1/integrations/pancake/runs/:id` | Kết quả run theo store, lỗi đã lọc |
+| `POST /v1/integrations/ctxlayer/connect` | Provision integration connection |
+| `POST /v1/integrations/ctxlayer/complete` | BFF hoàn tất OAuth; one-time state |
+| `DELETE /v1/integrations/ctxlayer/connection` | Pause job mới, tăng generation, revoke nếu hỗ trợ |
+| API products/inventory Fufuni hiện có | Halifruit đọc DB, không gọi MCP |
+
+Giá/tồn có snapshot age: hiển thị `last_success_at` trên trang vận hành, phân biệt
+last_attempt và last_success. Khi sync hỏng, catalog đã commit vẫn đọc được;
+quyết định stale stock có được checkout theo TTL hay phải chặn cần được cấu hình
+và kiểm thử, tái sử dụng guard `inventory_stale` hiện có. Không hứa tồn POS real-time
+hoặc giữ chỗ atomic chỉ vì job polling chạy thành công.
+
+## 7. Cấu trúc folder đề xuất
+
+Các file mới bên dưới là đề xuất, chưa được tạo bởi tài liệu này.
 
 ```text
-fufuni/apps/merchant/
-├── src/
-│   ├── integrations/ctxlayer/             [mới]
-│   │   ├── contracts.ts                  # Request/response Zod + DTO
-│   │   ├── config.ts                     # Typed Env, endpoint allowlist
-│   │   ├── identity.ts                   # Verified actor/store
-│   │   ├── oauth.ts                      # DCR, PKCE, complete, refresh, revoke
-│   │   ├── secrets.ts                    # AES-GCM + key version
-│   │   ├── store.ts                      # Persistence abstraction / DO RPC
-│   │   ├── sql.ts                        # Schema và SQL trong DO
-│   │   ├── client.ts                     # SDK lifecycle, auth, timeout
-│   │   ├── pancake-orders.ts             # Tool allowlist + DTO adapter
-│   │   └── errors.ts                     # Stable errors/redaction
-│   ├── routes/ctxlayer.ts                [mới] thin OpenAPI handlers
-│   ├── index.ts                          [sửa] mount router
-│   ├── types.ts                          [sửa] Env/DO RPC/auth typing
-│   └── do.ts                             [sửa] schema lifecycle + atomic RPC
-├── tests/ctxlayer/                       [mới]
-│   ├── oauth.test.ts
-│   ├── authorization.test.ts
-│   ├── orders.test.ts
-│   ├── store.runtime.test.ts
-│   └── transport.runtime.test.ts
-├── scripts/smoke-ctxlayer.mjs            [mới]
-└── .env.example                         [sửa] placeholder, không có secrets
+fufuni/apps/merchant/src/
+├── integrations/ctxlayer/               # mới: kết nối reusable
+│   ├── config.ts                       # Typed Env, trusted endpoints
+│   ├── contracts.ts                    # OAuth/status schemas
+│   ├── oauth.ts                        # DCR/PKCE/refresh/revoke
+│   ├── secrets.ts                      # Token encryption
+│   ├── store.ts                        # DO persistence/RPC
+│   ├── client.ts                       # MCP lifecycle, auth, deadline
+│   └── errors.ts                       # Stable error mapping
+├── integrations/pancake/                # mới: nguồn catalog
+│   ├── catalog-source.ts               # Interface, source selector
+│   ├── direct-source.ts                # Bọc reader REST hiện có
+│   ├── mcp-source.ts                   # MCP → canonical source snapshot
+│   ├── source-schemas.ts               # Schema/version/pagination checks
+│   └── sync-runs.ts                    # Run status/checkpoints
+├── lib/pancake-sync.ts                  # sửa: inject source, giữ orchestrator
+├── lib/pancake-source.ts                # tách: model/normalize khỏi HTTP
+├── lib/pancake-store.ts                 # sửa tối thiểu: run/source metadata
+├── lib/stores.ts                        # cấu hình source theo store
+├── routes/pancake.ts                    # mở rộng status/sync/run
+├── routes/ctxlayer.ts                   # mới: integration provisioning
+├── do.ts                               # schema, atomic claim/commit/refresh
+├── types.ts                            # Env + RPC typing
+└── index.ts                            # route/scheduled wiring
 
-halifruit-fe-v1/src/
-├── lib/fufuni/ctxlayer.server.ts         [mới] typed server fetch
-├── app/api/integrations/ctxlayer/        [mới] BFF routes + callback
-└── app/<staff-area>/integrations/ctxlayer/ [mới] chọn theo guard staff sẵn có
-    └── page.tsx                         # Connect/status/read/disconnect
+fufuni/apps/merchant/tests/
+├── ctxlayer/                            # OAuth, isolation, transport tests
+└── pancake-mcp-sync/                    # paging, mapping, rollback, replay
+fufuni/apps/merchant/scripts/smoke-pancake-mcp-sync.mjs
+
+pancake-pos-mcp/src/tools/               # chỉ thêm tool snapshot nếu gate yêu cầu
+
+halifruit-fe-v1/src/lib/fufuni/           # giữ API đọc catalog hiện có
+halifruit-fe-v1/src/app/<staff-area>/integrations/pancake/
+                                        # status, connect, sync trial, run report
+halifruit-fe-v1/src/app/api/integrations/ctxlayer/callback/
+                                        # BFF provisioning, không phục vụ storefront
 ```
 
-Chọn staff-area theo router/auth thực tế ở phase 0, không dựng trang trong
-storefront public. Dùng schema contract được đồng bộ từ Fufuni/OpenAPI, không
-cho hai bên tự diễn giải khác kiểu response. SQL đặt trong module sql/DO,
-không inline trong route. Refresh/state consume là DO RPC atomic, không giả định
-hai lời `query()` + `run()` riêng tạo thành transaction.
+Không thêm SQL vào route. Schema/DO RPC state consume, lease fencing, snapshot
+commit và token CAS phải atomic. Contract OpenAPI/backend và typed BFF cùng schema.
+Chọn staff-area theo router/guard thực tế, không dựng trang public cho admin token.
 
-Storage dự kiến trong MerchantDO của store hiện hành:
+## 8. Cấu hình local
 
-- `ctxlayer_clients`: issuer/client registration/redirect fingerprint, unique issuer+config.
-- `ctxlayer_connections`: unique actor_issuer+actor_sub; encrypted token bundle,
-  key version, expiry, status, generation, refresh claim/version, timestamps.
-- `ctxlayer_oauth_transactions`: hashed state, actor/store/browser-binding,
-  encrypted verifier, expiry, consumed flag; consume một lần bằng atomic RPC.
-- `ctxlayer_audit`: metadata connect/disconnect/read result code, không lưu đơn/token.
-
-Store isolation dựa trên MerchantDO routing hiện có, vẫn bind store vào OAuth
-transaction và identity. Mã hóa AES-GCM với random IV và AAD store+actor+issuer;
-key tách khỏi database. Dọn giao dịch hết hạn qua cơ chế cleanup sẵn có.
-
-## 7. Cấu hình local
-
-| Thành phần | Địa chỉ dự kiến |
+| Dịch vụ | Địa chỉ dự kiến |
 |---|---|
 | ctxlayer | `https://localhost:8787/mcp` |
-| Fufuni merchant | `http://localhost:8788` |
+| Fufuni | `http://localhost:8788` |
+| Pancake MCP | `http://127.0.0.1:3000/mcp` |
 | Halifruit | `http://localhost:3002` |
-| Pancake MCP thật | `http://127.0.0.1:3000/mcp` |
-| Fixture POS | `http://127.0.0.1:3101/mcp` |
 
-Env mới trong Fufuni (tên đề xuất, chưa có hiệu lực):
+Env đề xuất trong backend, chưa có hiệu lực cho đến khi triển khai:
 
 ```dotenv
+PANCAKE_CATALOG_SOURCE=ctxlayer_mcp
+PANCAKE_SYNC_ENABLED=false
 CTXLAYER_MCP_ENABLED=false
 CTXLAYER_MCP_URL=https://localhost:8787/mcp
-CTXLAYER_OAUTH_REDIRECT_URI=http://localhost:3002/api/integrations/ctxlayer/callback
 CTXLAYER_PANCAKE_UPSTREAM_SLUG=up-pancake-pos
-CTXLAYER_MCP_TIMEOUT_MS=15000
-CTXLAYER_MCP_MAX_RESPONSE_BYTES=262144
+CTXLAYER_OAUTH_REDIRECT_URI=http://localhost:3002/api/integrations/ctxlayer/callback
 CTXLAYER_TOKEN_KEY_VERSION=1
-CTXLAYER_TOKEN_KEY=<base64 random 32-byte key, private local env>
+CTXLAYER_TOKEN_KEY=<base64 random 32-byte key trong private local env>
 ```
 
-BFF dùng `FUFUNI_BACKEND_URL=http://localhost:8788` và identity config ở phase 0.
-Không fallback URL production khi đang test MCP local. Không đặt secret dưới
-`NEXT_PUBLIC_*`. Feature flag chỉ bật sau policy và identity gate.
+Giữ shop/kho mapping theo store; API key Pancake và `MCP_AUTH_TOKEN` cho mode MCP
+chỉ cần tại Pancake MCP. Credential direct hiện có có thể vẫn cần cho workflow khác,
+không xóa toàn cục khi chuyển reader catalog. Không đưa secret vào `NEXT_PUBLIC_*`.
 
-Fufuni cần lệnh dev local-only dùng `wrangler.halifruit.jsonc --local --port 8788`,
-resource names/persistence riêng và env local; kiểm tra config trước khi chạy.
-Thử HTTPS trust từ workerd của Fufuni tới ctxlayer ngay phase 0. Không dùng
-`NODE_TLS_REJECT_UNAUTHORIZED=0`, không giả định Node CA tự áp dụng cho workerd.
-Nếu chứng chỉ local chưa được tin cậy, sửa trust hoặc dùng transport local do
-runtime hỗ trợ và đồng bộ issuer/base URL/DCR; không tiếp tục OAuth với issuer lệch.
-Không mở tunnel public hay deploy để lách vấn đề trust trong phạm vi local.
+Local Worker Fufuni dùng config Halifruit với `--local --port 8788`, persistence
+riêng; không chạy lệnh deploy hoặc gọi URL backend production mặc định của FE.
+Ban đầu chỉ trigger trial manual; bật cron local sau khi fixture pass. Tần suất
+15 phút là cấu hình cron hiện có, cần đo quota/latency trước khi giữ cho MCP.
 
-## 8. Phases, checklist và gate
+Gate network: probe discovery từ chính workerd Fufuni tới ctxlayer HTTPS local.
+Tin cậy cert đúng cách; không `NODE_TLS_REJECT_UNAUTHORIZED=0`. Nếu phải thay
+local transport/origin, đồng bộ issuer/resource/redirect/DCR trước OAuth, không
+mở tunnel/deploy ngoài phạm vi local. Chưa cần Queue/Workflow/R2 mới cho snapshot
+đã giới hạn; nếu runtime deadline không đủ, thiết kế durable dispatcher/staging
+với ownership/checkpoint rõ ràng rồi mới mở rộng dung lượng.
 
-### Phase 0 — baseline, identity và network
+## 9. Phases và checklist
 
-- [ ] Ghi revision/status ba repo; giữ nguyên thay đổi đang có trong Fufuni/Halifruit.
-- [ ] Đọc AGENTS trong đường dẫn làm việc; kiểm tra scripts/package manager từng repo.
-- [ ] Xác minh phiên staff Halifruit → verified actor/store Fufuni, chọn JWT hoặc BFF assertion.
-- [ ] Lệnh local Fufuni đúng config/store, không remote binding/cron ngoài ý muốn.
-- [ ] Probe issuer metadata và TLS từ chính Fufuni workerd; thống nhất callback.
-- [ ] Baseline các suite auth/stores/commerce/pancake của Fufuni.
+### Phase 0 — baseline và contract
 
-Gate: có danh tính ổn định đã verify, mạng local hoạt động và không đụng production.
-Không bỏ gate này bằng một token dùng chung gắn email tự khai báo.
+- [ ] Đọc AGENTS từng repo; ghi status/revision, giữ thay đổi sẵn có.
+- [ ] Chạy baseline auth/store/pancake-sync/commerce; xác minh DO/store routing.
+- [ ] Chốt integration principal, quyền read-only, config local và TLS workerd.
+- [ ] Probe catalog/schema/response; lập field matrix normalizer vs MCP fields.
+- [ ] Quyết định dùng tools hiện có hay thêm snapshot reader trong MCP con.
 
-### Phase 1 — contract, persistence và OAuth backend
+Gate: đủ field/pagination/kho và có đường OAuth cho background job; chưa commit catalog.
 
-- [ ] Typed Env, feature flag default OFF; dependency MCP client ghim version v1.
-- [ ] Schema/DO RPC: encrypted token, atomic state consume, version/refresh locking.
-- [ ] DCR/PKCE/callback, cookie binding, cleanup mọi nhánh, reconnect/disconnect.
-- [ ] Endpoint auth/store isolation, public-key denied, Origin/CSRF ở BFF.
-- [ ] Test restart vẫn đọc được connection; sai key/AAD không decrypt được.
+### Phase 1 — connection của store
 
-Gate: kết nối OAuth thật local thành công; token không rời server; state replay/cross-user fail.
+- [ ] Typed Env, source flag default direct/disabled theo môi trường đã chọn; không tự bật cron.
+- [ ] OAuth/DCR/PKCE, integration identity verification, encrypted token persistence.
+- [ ] Refresh lock/CAS, disconnect generation và reauth_required; state/callback security.
+- [ ] Gateway read-only rules; fake token không vượt auth và không fallback direct.
 
-### Phase 2 — MCP adapter read-only và nghiệm thu backend
+Gate: connection vẫn dùng được sau restart/backend job không có phiên browser.
 
-- [ ] `initialize` + paginated `tools/list`, xác minh tool/schema theo upstream đã cấu hình.
-- [ ] Chỉ gọi manage_orders/list; validate input giới hạn 5, response compact/size cap.
-- [ ] DTO parser và lỗi ổn định cho MCP isError, JSON sai, timeout/401/403/429.
-- [ ] Token refresh đồng thời một lần, rotated token không bị ghi đè; client luôn close.
-- [ ] Backend có thể chạy smoke không cần UI/LLM; tuyệt đối không direct-API fallback.
+### Phase 2 — source adapter và job trial
 
-Gate: Fufuni gọi fixture thông qua ctxlayer; OFF/revoke làm số lần đọc fixture không tăng.
+- [ ] Tách reader khỏi normalizer, CatalogSource interface và MCP implementation.
+- [ ] Fixture catalog đa trang có product/variant/price/warehouse stock/flags/images.
+- [ ] Trial một sản phẩm: fetch → normalize → atomic commit → đọc API Fufuni.
+- [ ] Replay trial không tạo trùng; không retire sản phẩm ngoài trial.
+- [ ] Gateway OFF/schema/auth/page lỗi giữ catalog trước, run báo lỗi rõ.
 
-### Phase 3 — màn hình Halifruit dành cho staff
+Gate: dữ liệu đã persist và còn đọc được khi MCP tắt; counter chứng minh job qua Gateway.
 
-- [ ] Trang guarded: status, Connect, Read 5 orders, Disconnect; loading và lỗi dễ hiểu.
-- [ ] BFF route server-only; no-store, schema chung, không generic tool execute.
-- [ ] Callback khi người dùng cancel, hết phiên, mở nhiều tab hoặc logout/login người khác.
-- [ ] Không ảnh hưởng checkout/customer page hoặc gọi MCP tự động khi render storefront.
+### Phase 3 — full snapshot và cron
 
-Gate: nhân viên thao tác trọn luồng bằng UI; staff khác không thấy kết nối/kết quả của họ.
+- [ ] Manual/cron dùng chung lease, fencing và source selector theo store.
+- [ ] Full snapshot completeness checks, counts/unique IDs, retire an toàn.
+- [ ] Reservation preserved, giá VND đúng, stock đúng kho, policy draft giữ nguyên.
+- [ ] Cache invalidation sau commit, warning riêng; stale inventory guard được kiểm thử.
+- [ ] Retry/backoff/deadline/abandoned; không hai pipeline direct/MCP cùng ghi.
 
-### Phase 4 — acceptance và báo cáo
+Gate: full sync và repeat đúng; process crash/page failure không tạo snapshot dở dang.
 
-- [ ] Offline fixture suite và local browser OAuth smoke đạt trên cùng revision.
-- [ ] API Pancake thật: một lần đọc tối đa 5 đơn khi credential đã cấu hình; không ghi.
-- [ ] Verify/build theo từng repo; ctxlayer `bun run verify` nếu có sửa code ctxlayer.
-- [ ] Regression Fufuni auth/stores/pancake-sync/commerce; test UI/BFF Halifruit liên quan.
-- [ ] Báo cáo phân biệt fixture pass, OAuth pass, provider pass/blocked; không log PII.
-- [ ] PR tách Fufuni backend và Halifruit UI; ghi dependency, migration và rollback.
+### Phase 4 — Halifruit đọc DB và trang vận hành
 
-Gate: đủ bằng chứng workflow + deny/revoke; không coi 24 cached tools là provider acceptance.
+- [ ] FE/BFF dùng API catalog/inventory hiện có, không thêm MCP read-through.
+- [ ] Staff UI status/connect/trial/full/report/disconnect, auth đúng store.
+- [ ] Halifruit vẫn đọc snapshot trước khi Gateway offline; hiển thị trạng thái sync
+      trên trang admin và áp dụng TTL giá/tồn cho checkout theo policy hiện có.
+- [ ] Customer không gọi được sync/admin API và không thấy secret/run data nhạy cảm.
 
-### Phase 5 — ghi có phê duyệt (ngoài MVP)
+Gate: chứng minh API request storefront không phát sinh outbound MCP call.
 
-Chỉ triển khai khi có yêu cầu riêng: Fufuni đề xuất `request_operation`, admin
-khác duyệt trong ctxlayer, requester execute/read theo operation ID. `unknown`
-phải đối soát, không resend. Phải thiết kế quan hệ với `commerce-pos.ts` trước
-khi cho tạo đơn để tránh hai pipeline cùng ghi một giao dịch.
+### Phase 5 — nghiệm thu và handover local
 
-## 9. Ma trận kiểm thử bắt buộc
+- [ ] Offline multi-page fixture, OAuth real local, provider read-only khi có config.
+- [ ] So sánh snapshot normalized của direct vs MCP trên cùng fixture, không so hai
+      lần lấy live có thể đã thay đổi; provider probe ghi thời điểm/nguồn rõ ràng.
+- [ ] Test hồi quy commerce/auth/store/sync; typecheck scoped nếu baseline repo còn lỗi.
+- [ ] Báo cáo revision/command/pass-fail/limits; phân biệt fixture, OAuth và provider.
+- [ ] Commit/PR theo repo, migration additive, rollback source flag có kiểm soát.
 
-| Tình huống | Bằng chứng mong đợi |
+Gate: sản phẩm/biến thể/giá/tồn hiển thị qua Fufuni API và deny/revoke có bằng chứng.
+Không mở đồng bộ đơn hàng hoặc ghi Pancake trong milestone này.
+
+## 10. Ma trận kiểm thử
+
+| Tình huống | Kết quả cần đạt |
 |---|---|
-| Chưa đăng nhập/public key/shared admin key thiếu actor | 401/403 trước MCP call |
-| State sai, hết hạn, replay, callback khác browser/store/user | Không exchange/lưu token |
-| OAuth deny hoặc metadata/issuer lạ | Cleanup state, không open redirect/SSRF |
-| Hai người connect cùng lúc | Mỗi token lưu đúng actor/store |
-| Token hết hạn, hai request cùng refresh | Một refresh hợp lệ; không ghi đè token mới |
-| Refresh grant bị revoke | Reauth required, không fallback secret khác |
-| MCP catalog tool đổi/mất hoặc schema không hợp lệ | Stable error, không chọn tool gần giống |
-| MCP trả isError/JSON sai/response quá lớn | Không trả success hoặc raw upstream body |
-| Read 5 đơn qua fixture | Đúng DTO; marker/counter chứng minh đi qua ctxlayer |
-| OFF/ACL/project revoke trong session đã mở | Không tăng upstream read count |
-| Xin action create/delete qua endpoint read-only | Bị từ chối trước MCP call |
-| Disconnect rồi request mới/in-flight hoàn tất | Không trả dữ liệu bằng connection đã bị thu hồi |
-| Hai store dùng cùng subject | Token/đơn của store A không dùng cho B |
-| Restart backend | Connection bền vững, OAuth state vẫn expiry/consume đúng |
-| Provider thật read | Tối đa 5 đơn, DTO tối thiểu, không mutation |
-| Pipeline commerce cũ | Các suite regression không đổi hành vi |
+| Cron không có browser session | Dùng connection store, refresh hợp lệ |
+| State replay/sai store/issuer/browser | Không exchange hoặc lưu connection |
+| Principal/grant bị revoke | Job blocked/reauth; không dùng credential khác |
+| MCP tool/schema thiếu trường | Lỗi contract; không default làm sai sản phẩm |
+| Giá VND, flags, ảnh và source SKU | Mapping giữ semantics hiện có |
+| Stock hai warehouse | Chỉ nhập kho cấu hình, giữ reserved Fufuni |
+| Snapshot đủ trang nhưng duplicate ID/count lệch | Reject snapshot, giữ DB trước |
+| Trial một sản phẩm | Không retire ngoài trial; repeat không trùng |
+| Full repeat/source direct→MCP | Stable ID và mapping không đổi |
+| Manual/cron đồng thời; worker cũ mất lease | Chỉ chủ lease hiện hành được commit |
+| Page 2 timeout/429/quyền bị thu hồi | Run lỗi/backoff; snapshot cũ nguyên vẹn |
+| Crash trước/trong DO commit | Không có catalog nửa mới nửa cũ |
+| Source config/disconnect đổi giữa run | Generation/fingerprint check chặn commit cũ |
+| Commit xong cache purge lỗi | Success with warning; không chạy lại mutation ngoài ý muốn |
+| Hai store/shop | Không lẫn token/link/giá/tồn/run status |
+| Gateway OFF sau sync | FE đọc DB; job mới thất bại; stale checkout guard áp dụng |
+| Customer mở trang sản phẩm | Không MCP initialize/callTool |
+| Provider read-only trial/full | Không tạo/sửa/xóa trên Pancake |
 
-Báo cáo cuối ghi revision, config local đã che secrets, command, pass/fail,
-upstream fixture counters và stable error. Không lưu ảnh token hoặc nội dung đơn
-khách hàng vào Git. CLI dùng RTK cho search/read/check; không lọc payload MCP bằng RTK.
+Audit chỉ lưu run/store/source/tool/code/latency/count, không log token, OAuth code,
+credential-bearing URLs, full provider bodies hoặc raw data có định danh nhạy cảm.
+CLI dùng RTK; không lọc JSON nghiệp vụ bằng RTK và không dùng LLM cho normalize.
 
-## 10. Thứ tự PR và rollback
+## 11. PR và rollback
 
-1. Fufuni identity + contracts + persistence + OAuth (feature OFF).
-2. Fufuni MCP adapter + backend fixture acceptance.
-3. Halifruit staff UI/BFF + local OAuth/read acceptance.
-4. Evidence/cấu hình read-only provider thật, nếu môi trường sẵn sàng.
+1. Contract/source split + MCP snapshot tool nếu cần.
+2. OAuth integration connection theo store và persistence/refresh tests.
+3. MCP CatalogSource + job trial/full/lease/commit/cache acceptance.
+4. Halifruit status/provisioning UI + đọc catalog đã persist + local evidence.
 
-Rollback bằng feature flag OFF và disconnect/grant revocation khi cần; giữ schema
-thêm mới tương thích, không drop bảng đang chứa token bằng migration rollback tự động.
-Không thay nguồn dữ liệu commerce bằng MCP ở milestone này.
+Tắt job mới bằng flags; connection revoke/disconnect nếu cần. Rollback source mode
+chỉ bởi admin có audit sau xác minh mapping/schema parity, không fallback tự động.
+Giữ catalog đã commit và run history; không drop bảng token/run trong rollback.
+Provider OFF không tự xóa catalog hoặc ép inventory về 0. Checkout vẫn theo policy
+stale inventory, không bỏ guard để trang có vẻ hoạt động.
 
-## 11. Trạng thái của bản kế hoạch
+## 12. Trạng thái
 
-Đã kiểm tra source và thiết kế workflow/folder/contracts/gates. Chưa thêm SDK,
-endpoint, bảng OAuth hoặc màn hình Halifruit; chưa chạy provider acceptance mới.
-Kế hoạch lưu tại ctxlayer theo yêu cầu, phần triển khai chính nằm trong Fufuni.
+Đã sửa kế hoạch theo luồng job đồng bộ và phạm vi catalog người dùng chọn.
+Chưa sửa runtime Fufuni/Halifruit/Pancake MCP, chưa chạy sync provider mới.
+Các checkbox là công việc còn lại; không coi folder đề xuất là code đã tồn tại.
