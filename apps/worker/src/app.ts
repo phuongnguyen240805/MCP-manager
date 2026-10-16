@@ -31,6 +31,7 @@ import { adminProductsRoute, adminTeamProductsRoute } from './api/admin-products
 import { adminAuditRoute } from './api/admin-audit'
 import { adminOAuthClientsRoute } from './api/admin-oauth-clients'
 import { adminUpstreamsRoute } from './api/admin-upstreams'
+import { operationsRoute } from './api/operations'
 import { adminGitSourcesRoute } from './api/admin-git-sources'
 import { adminDocsRoute } from './api/admin-docs'
 import { adminUsersRoute } from './api/admin-users'
@@ -57,6 +58,7 @@ app.route('/api/version', versionRoute)
 app.route('/api/me', meRoute)
 app.route('/api/config', configRoute)
 app.route('/api/auth', authRoute)
+app.route('/api/operations', operationsRoute)
 app.route('/api/users', usersRoute)
 app.route('/api/teams', teamsRoute)
 app.route('/api/products', productsRoute)

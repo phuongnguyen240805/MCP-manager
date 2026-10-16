@@ -1,6 +1,10 @@
 # P — KEDI MCP Hub: kế hoạch kiến trúc và triển khai
 
-Ngày lập: 2026-10-16. Trạng thái: **đang triển khai; chưa nghiệm thu toàn bộ**.
+Ngày lập: 2026-10-16. Trạng thái: **triển khai và nghiệm thu local; chưa triển khai Cloudflare thật**.
+
+Phạm vi đã chốt với người dùng: hoàn thiện local trước. MCP giả lập thay cho
+API nhà cung cấp trong các gate local; không cần credential Pancake thật để
+kiểm chứng approval/idempotency. Nghiệm thu nhà cung cấp và production là gate riêng.
 
 ### Tiến độ triển khai 2026-10-16
 
@@ -20,8 +24,8 @@ khác nhau đăng ký connection/upstream riêng. Mỗi doanh nghiệp vẫn dù
 | 0 | Đã khảo sát source/bindings và baseline; chưa có tenant/shop sandbox được xác nhận |
 | 1 | Có fake transport + D1 integration tests; chưa xác nhận Pancake thật/OAuth client thật |
 | 2 | Đã triển khai enforcement, API và UI; verify, build và smoke local đạt; chưa nghiệm thu connector thật |
-| 3 | Chưa triển khai approval/operation ledger; `approval_required` hiện luôn chặn |
-| 4 | Đã test cách ly hai upstream bằng fixture; chưa onboard Meta/Google thật |
+| 3 | Đã có operation ledger, approval, claim nguyên tử, audit bền vững, unknown/reconciliation; nghiệm thu bằng fixture local |
+| 4 | Có hai MCP HTTP giả lập chạy độc lập và script nghiệm thu xuyên Hub; chưa onboard Meta/Google thật |
 | 5–7 | Chưa provision/deploy Cloudflare hoặc triển khai Agent Runtime |
 
 Migration mới: `0041_invocation_policy.sql`. Queue persist thêm args để đọc
@@ -36,15 +40,142 @@ Giới hạn test worker tránh timeout của test archive 80 MiB trên máy Win
 không tăng timeout hoặc bỏ kiểm thử. Đây là smoke hạ tầng/auth/SPA, không phải
 bằng chứng gọi Pancake/Meta/Google thật. RAG/AI và OAuth provider thật chưa nghiệm thu.
 
-Gate còn thiếu: repo Pancake bên cạnh chưa có `.dev.vars`/`.env`, và process
+Gate cho connector thật sau này: repo Pancake bên cạnh chưa có `.dev.vars`/`.env`, và process
 hiện tại chưa cấu hình `PANCAKE_POS_API_KEY`, `PANCAKE_POS_SHOP_ID`, `MCP_AUTH_TOKEN`.
 Cần người vận hành cấu hình credential sandbox trong file bị gitignore hoặc
 secret store (không gửi giá trị qua chat), xác nhận shop/project dùng thử, rồi
-nghiệm thu read-only qua Hub trước khi mở phase ghi dữ liệu. Staging cần chốt
+nghiệm thu read-only qua Hub trước khi mở ghi trên dữ liệu thật. Staging cần chốt
 account/domain và tài nguyên riêng; đợt này chưa deploy hoặc migrate remote.
 
+### Đợt 2 — workflow local có thể chạy lại
+
+Luồng đã triển khai:
+
+```text
+AI / REST client
+  → request_operation (requestId ổn định, tool và args cụ thể)
+  → pending trong D1 + audit cùng transaction
+  → admin khác, đang active và thuộc project, xem đúng args rồi approve/reject
+  → execute_operation / POST /api/operations/:id/execute
+  → kiểm tra lại user, project, policy version, schema và fingerprint credential/config
+  → conditional claim approved → running + audit
+  → gọi MCP con một lần
+  → succeeded hoặc unknown
+  → get_operation / GET /api/operations/:id để đọc theo quyền hiện hành
+```
+
+- `requestId` giống nhau và args canonical giống nhau trả cùng operation;
+  đổi ý định phải dùng requestId mới. ID operation được server tạo.
+- `approval_required` luôn chặn đường proxy/queue thông thường. Chỉ đường
+  operation đã được duyệt mới được thực thi. Tool có policy `allow` hoặc
+  upstream legacy vẫn giữ semantics cũ; cần phân loại các action ghi thành
+  `approval_required` trong cấu hình connector.
+- Approval hết hạn sau một giờ từ lúc đề nghị. Không tự duyệt; admin phải
+  còn active và thuộc project tại thời điểm thực thi. Upstream private cần
+  chia sẻ với org và cấp quyền phù hợp để một admin khác có thể duyệt.
+- Mỗi operation có tối đa một outbound dispatch. Không hứa exactly-once
+  ở provider. Claim xong nhưng process chết trước/sau outbound đều cần
+  đối soát; lease chạy quá 10 phút chuyển `unknown` ở lần đọc hợp lệ kế tiếp.
+- Timeout/lỗi sau dispatch, hoặc provider thành công nhưng ghi kết quả D1
+  thất bại, không cho phép gửi lại operation. Admin ghi kết quả đối soát
+  kèm ghi chú và reference; việc này không gọi lại provider.
+- State transition, `operation_events` và `audit_log` commit cùng transaction.
+  Lỗi audit trước claim không được outbound. Nếu database mất kết nối sau
+  outbound, ledger còn `running` sẽ hết lease thành `unknown`, không reclaim.
+- Operation executor hiện chạy trực tiếp qua MCP/REST và có progress heartbeat
+  cho MCP client hỗ trợ. Nó chưa dùng queue executor; queue async hiện có vẫn
+  được kiểm tra quyền và không được dùng để vượt approval.
+- Validator gateway dùng converter schema hiện có, không hỗ trợ đầy đủ mọi
+  keyword JSON Schema. MCP con vẫn phải validate nghiệp vụ; fingerprint schema
+  đổi sẽ vô hiệu approval. Chưa nghiệm thu schema/provider cụ thể ngoài fixture.
+
+Các module thực tế của đợt này:
+
+```text
+apps/worker/src/
+├── operations/
+│   ├── canonical.ts          # Canonical args + hash
+│   ├── access.ts             # Snapshot, requester và approver scope
+│   ├── requests.ts           # Tạo/lấy/expire operation
+│   ├── decisions.ts          # Approve/reject/reconcile
+│   └── execute.ts            # Claim, dispatch, ghi kết quả/unknown
+├── api/operations.ts         # API cho requester, auth + CSRF
+├── api/upstream-operations.ts # API admin trong từng upstream
+├── mcp/operation-tools.ts    # request/get/execute_operation
+├── db/queries/operations.ts  # SQL tập trung
+└── db/migrations/0042_approved_operations.sql
+
+apps/web/src/
+├── lib/api/operations.ts
+└── routes/admin/upstreams/OperationsSection.tsx
+
+apps/worker/test/fixtures/mcp-local.mjs
+scripts/smoke-kedi-local.mjs
+```
+
+Chạy ba terminal từ root repo (cần dependencies, TLS local và `.dev.vars`
+theo môi trường dev hiện có):
+
+```powershell
+bun run dev:worker:local
+```
+
+```powershell
+bun run dev:mcp-fixture 3101 pos
+```
+
+```powershell
+bun run dev:mcp-fixture 3102 ads
+```
+
+Terminal kiểm tra:
+
+```powershell
+$env:VITEST_MAX_WORKERS = '2'
+rtk err bun run verify
+rtk bun run smoke:kedi-local
+rtk bun run smoke https://localhost:8787
+```
+
+`dev:worker:local` dùng `wrangler dev --local` để tắt remote bindings. D1,
+R2/KV và DO dùng môi trường local. Không gọi RAG/AI hoặc IdP bên ngoài trong
+bộ nghiệm thu này. `dev:local` chạy cả Worker local và Vite nếu cần phát triển UI.
+
+Script nghiệm thu chỉ chấp nhận origin HTTPS loopback, kiểm tra hai server
+là fixture, seed user/admin/team/project giả vào D1 local rồi gọi API thật
+của Hub và transport MCP HTTP thật. Mỗi lần chạy tạo một bộ dữ liệu có suffix
+riêng và giữ lại để kiểm tra; không thay tài khoản nghiệp vụ sẵn có. Session
+test được ký bằng secret local đọc từ file ignored, không in cookie/secret.
+Token `kedi-local-fixture` là token công khai chỉ dành cho hai fixture loopback.
+Script dùng Wrangler ghim trong workspace Worker để khớp runtime dev.
+
+Kết quả HTTP acceptance đợt 2: **17/17**. Đã kiểm chứng catalog hai connector,
+pending không ghi, retry cùng ý định, intent đổi bị chặn, execution đồng thời
+chỉ dispatch một lần, replay kết quả, sai shop, unknown sau provider đã ghi,
+đối soát không resend và MCP thứ hai hoạt động khi MCP thứ nhất OFF.
+Đây là HTTP REST của Hub → MCP HTTP; kiểm thử tích hợp riêng dùng MCP SDK
+client → Hub → MCP con để kiểm chứng request/approval/execute/replay qua protocol.
+Không tuyên bố đã thử OAuth client/IdP hoặc API Pancake/Meta/Google thật.
+
+Validation chốt ngày 2026-10-16 trên nhánh `codex/kedi-approved-operations`:
+
+| Lệnh | Kết quả |
+|---|---|
+| `VITEST_MAX_WORKERS=2 bun run verify` qua RTK | Đạt typecheck, Biome, unit và integration offline |
+| `bun run build` qua RTK | Đạt; bundler còn cảnh báo kích thước chunk web |
+| `bun run smoke:kedi-local` qua RTK | 17/17, hai MCP fixture HTTP trên loopback |
+| `bun run smoke https://localhost:8787` qua RTK | 11/11, health/auth/MCP/SPA/collab |
+| `git diff --check` qua RTK | Không có lỗi whitespace |
+
+Giới hạn worker test bằng 2 để tránh tranh tài nguyên ở bài archive lớn trên
+Windows; không bỏ test hay tăng timeout. Build Worker chỉ dry-run local.
+
+Gate production còn lại: retention/backup của operation data, quota/metrics,
+executor cho tác vụ dài nếu cần, connector contracts và idempotency phía provider,
+nghiệm thu IdP/client thật, staging riêng. Các phase 5–7 chưa chạy theo phạm vi đã chốt.
+
 Tài liệu này là kế hoạch riêng cho KEDI, không thay thế `docs/PLAN.md`.
-Các checkbox biểu thị công việc cần làm; việc có tên file trong cây đề xuất
+Các checkbox chưa đánh dấu biểu thị công việc/gate còn lại; việc có tên file trong cây đề xuất
 không có nghĩa file hoặc tính năng đó đã tồn tại.
 
 ## 1. Mục tiêu và phạm vi
@@ -473,12 +604,12 @@ Gate: yêu cầu bị chặn không chạm upstream; queue chờ không vượt 
 
 Mục tiêu: mở một thao tác ghi ít rủi ro với khả năng đối soát.
 
-- [ ] Thiết kế state machine operation và approval cùng migration.
-- [ ] Thêm API/UI đề nghị, duyệt, từ chối, hết hạn và audit.
-- [ ] Bind approval vào đúng args/scope/version; claim nguyên tử.
-- [ ] Chặn replay đồng thời; phân biệt retry cùng operation và yêu cầu mới.
-- [ ] Xử lý timeout sau dispatch thành unknown khi không thể xác minh kết quả.
-- [ ] Thử nghiệm fault injection: provider thành công nhưng lưu kết quả thất bại.
+- [x] Thiết kế state machine operation và approval cùng migration.
+- [x] Thêm API/MCP đề nghị, UI admin duyệt/từ chối/đối soát, hết hạn và audit.
+- [x] Bind approval vào đúng args/scope/version; claim nguyên tử.
+- [x] Chặn replay đồng thời; phân biệt retry cùng operation và yêu cầu mới.
+- [x] Xử lý timeout sau dispatch thành unknown khi không thể xác minh kết quả.
+- [x] Thử nghiệm fault injection: provider giả thành công nhưng lưu kết quả thất bại.
 
 Đầu ra: một action ghi có đường duyệt/ghi/đối soát xuyên suốt.
 Gate: không tuyên bố exactly-once nếu provider không hỗ trợ; không blind retry.

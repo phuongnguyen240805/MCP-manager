@@ -7,6 +7,8 @@
   "scripts": {
     "predev": "bun ../../scripts/setup-dev-tls.mjs && bun ../../scripts/ensure-dist.mjs && wrangler d1 migrations apply DB --local",
     "dev": "wrangler dev --https-key-path ../../.dev-tls/localhost-key.pem --https-cert-path ../../.dev-tls/localhost.pem",
+    "predev:local": "bun run predev",
+    "dev:local": "wrangler dev --local --https-key-path ../../.dev-tls/localhost-key.pem --https-cert-path ../../.dev-tls/localhost.pem",
     "prebuild": "bun ../../scripts/ensure-dist.mjs",
     "build": "wrangler deploy --dry-run --outdir dist",
     "predeploy": "bun --filter='@ctxlayer/web' run build && bun ../../scripts/ensure-dist.mjs",

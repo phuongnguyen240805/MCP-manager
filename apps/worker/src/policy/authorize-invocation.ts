@@ -34,6 +34,7 @@ export async function authorizeInvocation(
   if (!isToolAllowed(indexToolAccess(rules).get(accessKey(upstreamId, tool)), principals)) {
     return { allowed: false as const, code: 'access_denied' }
   }
+  let approvalRequired = false
   if (stored) {
     let json: unknown
     try {
@@ -46,7 +47,8 @@ export async function authorizeInvocation(
       return { allowed: false as const, code: 'policy_invalid' }
     }
     const code = evaluateInvocation(parsed.data, principals, tool, args)
-    if (code) return { allowed: false as const, code }
+    if (code && code !== 'approval_required') return { allowed: false as const, code }
+    approvalRequired = code === 'approval_required'
   }
   const conn = toUpstreamConnection(row)
   if (conn.authStrategy === 'shared_bearer') {
@@ -58,6 +60,13 @@ export async function authorizeInvocation(
     if (!credential.present || credential.needsReauth) {
       // The interactive path preserves its existing first-party recovery message.
       return { allowed: false as const, code: 'credential_revoked' }
+    }
+  }
+  if (approvalRequired && stored) {
+    return {
+      allowed: false as const,
+      code: 'approval_required',
+      approval: { row, conn, version: stored.version, productId: stored.product_id }
     }
   }
   return { allowed: true as const, row, conn, version: stored?.version ?? 0 }

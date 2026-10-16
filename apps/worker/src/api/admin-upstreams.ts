@@ -54,11 +54,13 @@ import { buildUpstreamToolsPayload } from './upstreams-attachments'
 import { notFound, parseJsonBody } from './respond'
 import { isUniqueViolation } from '../db/queries/util'
 import { invocationPolicyRoute } from './invocation-policy'
+import { upstreamOperationsRoute } from './upstream-operations'
 
 export const adminUpstreamsRoute = new Hono<{ Bindings: Env; Variables: AuthedVariables }>()
 adminUpstreamsRoute.use('*', requireAdmin)
 adminUpstreamsRoute.use('*', requireCsrf)
 adminUpstreamsRoute.route('/:id/invocation-policy', invocationPolicyRoute)
+adminUpstreamsRoute.route('/:id/operations', upstreamOperationsRoute)
 
 // Refusal for org-scoping writes (grants, per-tool ACL) on a private
 // upstream: its owner is its whole audience, so a rule could only widen it.

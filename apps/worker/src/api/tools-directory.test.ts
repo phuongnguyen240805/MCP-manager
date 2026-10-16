@@ -52,7 +52,14 @@ describe('groupDirectoryTools', () => {
   })
 
   it('SHOWS a locked tool with restricted:true + requires as display names', () => {
-    const groups = groupDirectoryTools('u1', 'up-ado', [tool('wit_query')], acl, principals(), names)
+    const groups = groupDirectoryTools(
+      'u1',
+      'up-ado',
+      [tool('wit_query')],
+      acl,
+      principals(),
+      names
+    )
     const t = groups[0]?.tools[0]
     expect(t?.name).toBe('wit_query') // shown, not hidden
     expect(t?.restricted).toBe(true)
@@ -73,7 +80,14 @@ describe('groupDirectoryTools', () => {
   })
 
   it('an open (no-rule) tool is never restricted', () => {
-    const groups = groupDirectoryTools('u1', 'up-ado', [tool('wit_work_item')], acl, principals(), names)
+    const groups = groupDirectoryTools(
+      'u1',
+      'up-ado',
+      [tool('wit_work_item')],
+      acl,
+      principals(),
+      names
+    )
     expect(groups[0]?.tools[0]).toMatchObject({ restricted: false })
     expect(groups[0]?.tools[0]?.requires).toBeUndefined()
   })
@@ -82,7 +96,10 @@ describe('groupDirectoryTools', () => {
 describe('resolveRequiresNames', () => {
   it('maps ids to display names', () => {
     expect(
-      resolveRequiresNames({ roles: ['r_eng'], teams: ['t_platform'], products: ['p_driver'] }, names)
+      resolveRequiresNames(
+        { roles: ['r_eng'], teams: ['t_platform'], products: ['p_driver'] },
+        names
+      )
     ).toEqual({ roles: ['Engineering'], teams: ['Platform'], products: ['Driver'] })
   })
 
@@ -101,6 +118,9 @@ describe('resolveRequiresNames', () => {
 describe('BUILTIN_TOOL_SLUGS', () => {
   it('is the pinned set of built-in tool names', () => {
     expect(BUILTIN_TOOL_SLUGS).toEqual([
+      'request_operation',
+      'get_operation',
+      'execute_operation',
       'whoami',
       'list_my_context',
       'list_upstreams',

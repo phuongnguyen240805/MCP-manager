@@ -18,6 +18,7 @@ import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mc
 import type { Env, McpProps } from '../env'
 import { findById } from '../db/queries/users'
 import { canReadJob } from '../policy/job-access'
+import { registerOperationTools } from './operation-tools'
 import { getDocByIdOrSlug, listDocs } from '../db/queries/docs'
 import { resolveUserScope } from '../db/queries/doc-tags'
 import { readSnapshot, readSourceMarkdown } from '../storage/docs-r2'
@@ -572,6 +573,7 @@ export class McpSessionDO extends McpAgent<Env, undefined, McpProps> {
     // resource template. Extracted to mcp/skill-mcp.ts to keep this
     // file focused on session lifecycle.
     registerSkillMcp(this.server, this.env, rec, () => this.props?.userId)
+    registerOperationTools(this.server, this.env, rec, () => this.props?.userId)
     // One MCP prompt per published skill — the deliberate-invocation
     // channel (slash list / prompt picker). Registered before the
     // hand-registered /draft-skill prompt below; reserved-name skip in

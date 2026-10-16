@@ -23,6 +23,24 @@ export type BuiltinTool = z.infer<typeof BuiltinTool>
 
 export const BUILTIN_TOOLS: BuiltinTool[] = [
   {
+    name: 'request_operation',
+    title: 'Request an approved operation',
+    description:
+      'Propose an exact upstream write for human approval. Use the same requestId when retrying the same intent; a different intent needs a new requestId. Nothing is executed by this tool. The user reviews it in Admin → Upstreams → Operations.'
+  },
+  {
+    name: 'get_operation',
+    title: 'Get operation status',
+    description:
+      'Read your operation status and result by operation ID. Unknown outcomes require human reconciliation and must not be retried as a new operation automatically.'
+  },
+  {
+    name: 'execute_operation',
+    title: 'Execute an approved operation',
+    description:
+      'Execute your exact approved operation once by ID. Repeated calls return the same state/result without dispatching again. Requires approval from a different active admin with project access. Never create a new request to bypass an unknown outcome.'
+  },
+  {
     name: 'whoami',
     title: 'Who am I?',
     description: 'Returns the user props attached to this MCP session by ctxlayer.'
@@ -101,7 +119,7 @@ export const BUILTIN_TOOLS: BuiltinTool[] = [
     name: 'save_draft_skill',
     title: 'Save draft skill',
     description:
-      'Saves a drafted skill (markdown `body` + `title`/`description`) owned by you, as a new PRIVATE draft — or, when you pass a `skillId` (or a `slug` that matches one of your own skills; org admins may target any skill this way), UPDATES that skill in place as a new version (its revision history is preserved; editing a published skill goes live to the org). Pair with `draft_skill` (or the `/draft-skill` prompt): it hands you this org\'s context, you draft the playbook, then call this to persist or revise it. Returns the skill id + slug + version + any schema-linter warnings. Refine and share from /app/skills.'
+      "Saves a drafted skill (markdown `body` + `title`/`description`) owned by you, as a new PRIVATE draft — or, when you pass a `skillId` (or a `slug` that matches one of your own skills; org admins may target any skill this way), UPDATES that skill in place as a new version (its revision history is preserved; editing a published skill goes live to the org). Pair with `draft_skill` (or the `/draft-skill` prompt): it hands you this org's context, you draft the playbook, then call this to persist or revise it. Returns the skill id + slug + version + any schema-linter warnings. Refine and share from /app/skills."
   }
 ]
 
