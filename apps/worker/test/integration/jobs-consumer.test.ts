@@ -1,10 +1,11 @@
 import { env } from 'cloudflare:test'
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import type { Env } from '../../src/env'
 import { runJob } from '../../src/queues/jobs-consumer'
 import { findJobById, insertRunningJob } from '../../src/db/queries/async-jobs'
 import type { UpstreamCallResult, UpstreamClient } from '../../src/upstream/upstream-client'
 import type { UpstreamConnection } from '../../src/db/queries/upstreams'
+import { hashJobKey } from '../../src/mcp/async-submit'
 
 /**
  * Real-D1 cover for the background job runner. `runJob` takes an injected
@@ -15,6 +16,11 @@ import type { UpstreamConnection } from '../../src/db/queries/upstreams'
  */
 const testEnv = env as unknown as Env
 
+beforeEach(async () => {
+  await testEnv.DB.prepare(`INSERT OR IGNORE INTO users (id, email, idp, idp_sub, created_at)
+    VALUES ('u1', 'job@example.test', 'github', 'job-user', 0)`).run()
+})
+
 async function seedUpstream(id: string, slug: string): Promise<void> {
   await testEnv.DB.prepare(
     `INSERT INTO upstream_servers
@@ -22,6 +28,10 @@ async function seedUpstream(id: string, slug: string): Promise<void> {
      VALUES (?1, ?2, ?2, 'streamable_http', 'https://x.test/mcp', 'none', '{}', 0, 0)`
   )
     .bind(id, slug)
+    .run()
+  await testEnv.DB.prepare(`INSERT INTO upstream_visibility (upstream_id, scope_kind, scope_id)
+    VALUES (?1, 'everyone', '')`)
+    .bind(id)
     .run()
 }
 
@@ -54,7 +64,7 @@ describe('jobs-consumer runJob', () => {
       sessionId: 's',
       upstreamId: 'ups-ok',
       tool: 'gather_task_context',
-      jobKey: 'kok',
+      jobKey: await hashJobKey('u1', 'ups-ok', 'gather_task_context', '{}'),
       createdAt: 1
     })
     await runJob(
@@ -75,7 +85,7 @@ describe('jobs-consumer runJob', () => {
       sessionId: 's',
       upstreamId: 'ups-err',
       tool: 't',
-      jobKey: 'kerr',
+      jobKey: await hashJobKey('u1', 'ups-err', 't', '{}'),
       createdAt: 1
     })
     await runJob(
@@ -100,10 +110,14 @@ describe('jobs-consumer runJob', () => {
       sessionId: 's',
       upstreamId: 'nope',
       tool: 't',
-      jobKey: 'kgone',
+      jobKey: await hashJobKey('u1', 'nope', 't', '{}'),
       createdAt: 1
     })
-    await runJob(testEnv, msg({ jobId: 'jgone', upstreamId: 'nope', tool: 't' }), fakeClient({ content: [] }))
+    await runJob(
+      testEnv,
+      msg({ jobId: 'jgone', upstreamId: 'nope', tool: 't' }),
+      fakeClient({ content: [] })
+    )
     const gone = await findJobById(testEnv, 'jgone')
     expect(gone?.status).toBe('error')
     expect(gone?.error_code).toBe('upstream_gone')
@@ -117,7 +131,7 @@ describe('jobs-consumer runJob', () => {
       sessionId: 's',
       upstreamId: 'ups-dup',
       tool: 't',
-      jobKey: 'kdup',
+      jobKey: await hashJobKey('u1', 'ups-dup', 't', '{}'),
       createdAt: 1
     })
     await runJob(

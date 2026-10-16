@@ -85,6 +85,7 @@ const CASES: GateCase[] = [
   { method: 'POST', path: '/api/admin/upstreams/up1/share' },
   { method: 'PUT', path: '/api/admin/upstreams/up1/visibility' },
   { method: 'PUT', path: '/api/admin/upstreams/up1/tool-access' },
+  { method: 'PUT', path: '/api/admin/upstreams/up1/invocation-policy' },
   { method: 'POST', path: '/api/admin/upstreams/up1/refresh-tools' },
   { method: 'PUT', path: '/api/admin/upstreams/up1/shared-credentials' },
   { method: 'DELETE', path: '/api/admin/upstreams/up1/shared-credentials' },

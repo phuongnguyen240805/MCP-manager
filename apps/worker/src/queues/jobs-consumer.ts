@@ -1,10 +1,6 @@
 import { z } from 'zod'
 import type { Env } from '../env'
-import {
-  getUpstreamById,
-  toUpstreamConnection,
-  type UpstreamConnection
-} from '../db/queries/upstreams'
+import { getUpstreamById } from '../db/queries/upstreams'
 import { resolveUserUpstreamBearer } from '../upstream/bearer'
 import { createUpstreamClient } from '../upstream/create-client'
 import { runUpstreamCall, type UpstreamCallOutcome } from '../mcp/upstream-call-runner'
@@ -13,6 +9,8 @@ import { buildUsageMsg } from '../usage/record'
 import { scrubErrorForStorage } from '../usage/error-detail'
 import { mangleToolName } from '../mcp/tool-name'
 import { errMessage } from '../util/errors'
+import { authorizeInvocation } from '../policy/authorize-invocation'
+import { hashJobKey } from '../mcp/async-submit'
 
 /**
  * Batch consumer for ctxlayer-jobs. One message per async tool submit
@@ -80,12 +78,24 @@ export async function runJob(
   const existing = await findJobById(env, j.jobId)
   if (!existing || existing.status !== 'running') return
 
+  // Queue input is a reference, not authority to change the persisted invocation.
+  if (
+    existing.user_id !== j.userId ||
+    existing.upstream_id !== j.upstreamId ||
+    existing.tool !== j.tool ||
+    existing.session_id !== j.sessionId ||
+    existing.job_key !== (await hashJobKey(j.userId, j.upstreamId, j.tool, j.argsJson))
+  ) {
+    return
+  }
+
   const t0 = Date.now()
   let args: unknown = {}
   try {
     args = JSON.parse(j.argsJson)
   } catch {
-    args = {}
+    await completeJobError(env, j.jobId, 'invalid_args', 'Invalid job arguments.', nowSec())
+    return
   }
 
   const row = await getUpstreamById(env, j.upstreamId)
@@ -99,21 +109,19 @@ export async function runJob(
     )
     return
   }
-  let conn: UpstreamConnection
-  try {
-    conn = toUpstreamConnection(row)
-  } catch {
+  const authorization = await authorizeInvocation(env, j.userId, j.upstreamId, j.tool, args)
+  if (!authorization.allowed) {
     await completeJobError(
       env,
       j.jobId,
-      'unsupported_transport',
-      'The upstream transport is no longer dialable.',
+      authorization.code,
+      `${authorization.code}: invocation blocked by current policy`,
       nowSec()
     )
     return
   }
-
-  const bearer = await resolveUserUpstreamBearer(env, row, conn, j.userId)
+  const conn = authorization.conn
+  const bearer = await resolveUserUpstreamBearer(env, authorization.row, conn, j.userId)
   if (conn.authStrategy !== 'none' && bearer === null) {
     await completeJobError(
       env,
@@ -145,7 +153,10 @@ export async function runJob(
     // error/timeout → terminal error job. The surface text is already
     // credential-scrubbed by runUpstreamCall (formatUpstreamError).
     const detail =
-      outcome.surface.content[0]?.text ?? outcome.errorDetail ?? outcome.errorCode ?? 'upstream_error'
+      outcome.surface.content[0]?.text ??
+      outcome.errorDetail ??
+      outcome.errorCode ??
+      'upstream_error'
     await completeJobError(env, j.jobId, outcome.errorCode ?? outcome.status, detail, nowSec())
   }
 

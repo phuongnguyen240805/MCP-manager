@@ -48,7 +48,7 @@ export function CreateUpstreamModal({
         url: url.trim(),
         authStrategy: persistedStrategy(authStrategy),
         authConfig: oauth ? { oauth } : undefined,
-        enabled: true,
+        enabled: false,
         private: isPrivate
       })
       onCreated(created.id)

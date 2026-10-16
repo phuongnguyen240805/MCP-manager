@@ -17,6 +17,7 @@ import { McpAgent } from 'agents/mcp'
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js'
 import type { Env, McpProps } from '../env'
 import { findById } from '../db/queries/users'
+import { canReadJob } from '../policy/job-access'
 import { getDocByIdOrSlug, listDocs } from '../db/queries/docs'
 import { resolveUserScope } from '../db/queries/doc-tags'
 import { readSnapshot, readSourceMarkdown } from '../storage/docs-r2'
@@ -227,13 +228,10 @@ export class McpSessionDO extends McpAgent<Env, undefined, McpProps> {
     // `packages/shared/src/builtin-tools.ts` (BUILTIN_TOOLS), pulled in via
     // `builtinToolMeta` so what the agent sees and what `/api/tools` lists
     // can't drift. Schemas + handlers stay here.
-    this.server.registerTool(
-      'whoami',
-      { ...builtinToolMeta('whoami') },
-      () =>
-        rec('whoami', undefined, async () => ({
-          content: [{ type: 'text', text: JSON.stringify(this.props ?? null, null, 2) }]
-        }))
+    this.server.registerTool('whoami', { ...builtinToolMeta('whoami') }, () =>
+      rec('whoami', undefined, async () => ({
+        content: [{ type: 'text', text: JSON.stringify(this.props ?? null, null, 2) }]
+      }))
     )
 
     this.server.registerTool(
@@ -305,12 +303,10 @@ export class McpSessionDO extends McpAgent<Env, undefined, McpProps> {
         rec('describe_upstream', args, async () => {
           const userId = this.props?.userId
           if (!userId) return errText('not_signed_in')
-          const body = await describeUpstreamForUser(
-            this.env,
-            userId,
-            args.slug,
-            { family: args.family, query: args.query }
-          )
+          const body = await describeUpstreamForUser(this.env, userId, args.slug, {
+            family: args.family,
+            query: args.query
+          })
           if (!body) return errText(`upstream not found: ${args.slug}`)
           return {
             content: [{ type: 'text', text: JSON.stringify(body, null, 2) }],
@@ -485,6 +481,8 @@ export class McpSessionDO extends McpAgent<Env, undefined, McpProps> {
             // Same not_found for missing OR not-owned — don't leak that a job id
             // exists for another user.
             if (!job || job.user_id !== userId) return errText('not_found: no such job')
+            if (!(await canReadJob(this.env, userId, job)))
+              return errText('access_denied: task access revoked')
             if (job.status === 'running') {
               const elapsed = Math.floor(Date.now() / 1000) - job.created_at
               return {
@@ -505,7 +503,9 @@ export class McpSessionDO extends McpAgent<Env, undefined, McpProps> {
                 content: [
                   {
                     type: 'text',
-                    text: sanitizeUntrustedText(job.error_detail ?? job.error_code ?? 'upstream_error')
+                    text: sanitizeUntrustedText(
+                      job.error_detail ?? job.error_code ?? 'upstream_error'
+                    )
                   }
                 ]
               }
@@ -553,13 +553,16 @@ export class McpSessionDO extends McpAgent<Env, undefined, McpProps> {
         const userId = this.props?.userId
         if (!userId) return errText('not_signed_in')
         const jobs = await listJobsForUser(this.env, userId, 20)
-        const body = jobs.map((j) => ({
-          job_id: j.id,
-          tool: j.tool,
-          status: j.status,
-          created_at: j.created_at,
-          completed_at: j.completed_at
-        }))
+        const readable = await Promise.all(jobs.map((job) => canReadJob(this.env, userId, job)))
+        const body = jobs
+          .filter((_job, i) => readable[i])
+          .map((j) => ({
+            job_id: j.id,
+            tool: j.tool,
+            status: j.status,
+            created_at: j.created_at,
+            completed_at: j.completed_at
+          }))
         return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] }
       })
     )
@@ -601,7 +604,9 @@ export class McpSessionDO extends McpAgent<Env, undefined, McpProps> {
       async (args) => {
         const userId = this.props?.userId
         if (!userId) {
-          return draftPromptNotice('You are not signed in to ctxlayer, so a skill cannot be drafted.')
+          return draftPromptNotice(
+            'You are not signed in to ctxlayer, so a skill cannot be drafted.'
+          )
         }
         const slugs = (args.upstreams ?? '')
           .split(',')
@@ -650,7 +655,10 @@ export class McpSessionDO extends McpAgent<Env, undefined, McpProps> {
 
     this.server.registerTool(
       'save_draft_skill',
-      { ...builtinToolMeta('save_draft_skill'), inputSchema: BUILTIN_INPUT_SHAPES.save_draft_skill },
+      {
+        ...builtinToolMeta('save_draft_skill'),
+        inputSchema: BUILTIN_INPUT_SHAPES.save_draft_skill
+      },
       (args) =>
         rec('save_draft_skill', args, async () => {
           const userId = this.props?.userId
@@ -835,6 +843,3 @@ export class McpSessionDO extends McpAgent<Env, undefined, McpProps> {
 }
 
 // ----- helpers ------------------------------------------------------------
-
-
-

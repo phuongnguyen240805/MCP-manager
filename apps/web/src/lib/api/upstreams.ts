@@ -13,6 +13,32 @@ import {
 import type { ToolAccessRule } from '@ctxlayer/shared'
 import { z } from 'zod'
 import { request } from './core'
+import { InvocationPolicyResponse, PutInvocationPolicyRequest } from '@ctxlayer/shared'
+
+export function fetchInvocationPolicy(
+  id: string,
+  signal?: AbortSignal
+): Promise<InvocationPolicyResponse> {
+  return request(
+    `/api/admin/upstreams/${encodeURIComponent(id)}/invocation-policy`,
+    (b) => InvocationPolicyResponse.parse(b),
+    { signal }
+  )
+}
+
+export function saveInvocationPolicy(
+  id: string,
+  input: PutInvocationPolicyRequest
+): Promise<InvocationPolicyResponse> {
+  return request(
+    `/api/admin/upstreams/${encodeURIComponent(id)}/invocation-policy`,
+    (b) => InvocationPolicyResponse.parse(b),
+    {
+      method: 'PUT',
+      body: JSON.stringify(PutInvocationPolicyRequest.parse(input))
+    }
+  )
+}
 
 // ----- admin upstreams ----------------------------------------------------
 

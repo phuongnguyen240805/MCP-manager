@@ -31,10 +31,11 @@ export interface AsyncJobRow {
   error_detail: string | null
   created_at: number
   completed_at: number | null
+  args_json: string | null
 }
 
 const COLS = `id, user_id, session_id, upstream_id, tool, job_key, status,
-              result_json, error_code, error_detail, created_at, completed_at`
+              result_json, error_code, error_detail, created_at, completed_at, args_json`
 
 /** Most recent job (any status) for a dedup key — drives submit dedup. */
 export async function findLatestJobByKey(env: Env, jobKey: string): Promise<AsyncJobRow | null> {
@@ -61,6 +62,7 @@ export interface InsertJobInput {
   tool: string
   jobKey: string
   createdAt: number
+  argsJson?: string
 }
 
 /**
@@ -70,10 +72,19 @@ export interface InsertJobInput {
  */
 export async function insertRunningJob(env: Env, j: InsertJobInput): Promise<void> {
   await env.DB.prepare(
-    `INSERT INTO async_jobs (id, user_id, session_id, upstream_id, tool, job_key, status, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)`
+    `INSERT INTO async_jobs (id, user_id, session_id, upstream_id, tool, job_key, status, created_at, args_json)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)`
   )
-    .bind(j.id, j.userId, j.sessionId, j.upstreamId, j.tool, j.jobKey, j.createdAt)
+    .bind(
+      j.id,
+      j.userId,
+      j.sessionId,
+      j.upstreamId,
+      j.tool,
+      j.jobKey,
+      j.createdAt,
+      j.argsJson ?? null
+    )
     .run()
 }
 
@@ -121,7 +132,11 @@ export async function supersedeRunningJob(env: Env, id: string, at: number): Pro
     .run()
 }
 
-export async function listJobsForUser(env: Env, userId: string, limit = 20): Promise<AsyncJobRow[]> {
+export async function listJobsForUser(
+  env: Env,
+  userId: string,
+  limit = 20
+): Promise<AsyncJobRow[]> {
   const res = await env.DB.prepare(
     `SELECT ${COLS} FROM async_jobs WHERE user_id = ?1 ORDER BY created_at DESC LIMIT ?2`
   )
@@ -152,6 +167,8 @@ export async function clearAsyncJobResults(env: Env, olderThanSeconds: number): 
 /** Nightly prune — drop jobs older than the retention window. Returns rows removed. */
 export async function pruneAsyncJobs(env: Env, olderThanSeconds: number): Promise<number> {
   const cutoff = Math.floor(Date.now() / 1000) - olderThanSeconds
-  const res = await env.DB.prepare(`DELETE FROM async_jobs WHERE created_at < ?1`).bind(cutoff).run()
+  const res = await env.DB.prepare(`DELETE FROM async_jobs WHERE created_at < ?1`)
+    .bind(cutoff)
+    .run()
   return res.meta.changes ?? 0
 }
