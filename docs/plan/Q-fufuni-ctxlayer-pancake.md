@@ -1,6 +1,7 @@
 # Đồng bộ catalog: Fufuni → ctxlayer → Pancake MCP → database → Halifruit
 
-Ngày cập nhật: 2026-10-16. Trạng thái: kế hoạch, chưa triển khai module mới.
+Ngày cập nhật: 2026-10-16. Trạng thái: đã triển khai lõi đồng bộ và nghiệm thu bằng fixture local;
+chưa nghiệm thu tài khoản tích hợp/IdP và shop Pancake thật.
 Tiếp nối [KEDI Hub](P-kedi-mcp-hub.md). Phạm vi local, chưa deploy Cloudflare thật.
 
 ## 1. Mục tiêu đã chốt
@@ -409,6 +410,121 @@ stale inventory, không bỏ guard để trang có vẻ hoạt động.
 
 ## 12. Trạng thái
 
-Đã sửa kế hoạch theo luồng job đồng bộ và phạm vi catalog người dùng chọn.
-Chưa sửa runtime Fufuni/Halifruit/Pancake MCP, chưa chạy sync provider mới.
-Các checkbox là công việc còn lại; không coi folder đề xuất là code đã tồn tại.
+Đã triển khai trong working tree Fufuni và Pancake MCP, kèm thay đổi identity
+resource của Gateway. Các phase/checklist phía trên là tiêu chí gốc; bằng chứng
+đã đạt và giới hạn thực tế được ghi bên dưới, không mặc định mọi checkbox đã đạt.
+
+## 13. Báo cáo triển khai local
+
+### Đã có code
+
+- Pancake MCP: tool mới `read_catalog_snapshot`, action `page`, 30 biến thể/trang,
+  tối đa 20 trang/600 biến thể. Trả shop ID, warehouse, count metadata và schema
+  version 1; allowlist fields giữ giá/currency, ảnh, SKU, trạng thái và stock theo kho.
+  Không dùng compact masks làm mất field, không trả audit identifiers không cần thiết.
+- ctxlayer: resource có xác thực `ctxlayer://identity` trả user ID hiện hành,
+  chặn tài khoản không active; Fufuni dùng để đối chiếu integration principal.
+- Fufuni: `src/integrations/ctxlayer/{config,secrets,store,client,oauth,setup-html}.ts`,
+  `src/integrations/pancake/{mcp-source,sync-runs}.ts`, `src/routes/ctxlayer.ts`.
+  Có OAuth/DCR/PKCE, encrypted tokens theo store/config, state/browser/actor binding,
+  token refresh CAS, disconnect generation và run history trong MerchantDO.
+- Runner `pancake-sync.ts` chọn source `direct` hoặc `ctxlayer_mcp`, không fallback.
+  Manual và cron dùng cùng runner/lease. MCP mode không cần Pancake API key ở reader
+  Fufuni; không xóa key phục vụ workflow direct/order khác.
+- Trial/full dùng normalizer, stable IDs và transaction catalog có sẵn; giữ reserved,
+  chỉ retire absent ở full snapshot hợp lệ; kiểm tra lease/connection generation khi commit.
+  Mất Gateway/quyền/schema/page lỗi không thay snapshot đã commit.
+- Trang vận hành local đặt tại Fufuni `/v1/integrations/ctxlayer/setup`: connect,
+  status, complete OAuth, trial/full và disconnect. Mutation dùng JWT staff Fufuni
+  đã verify, browser binding/Origin protection; token nhập chỉ ở memory trang.
+  Sau redirect OAuth phải nhập lại JWT để hoàn tất, không lưu vào localStorage.
+- Halifruit giữ đường đọc API Fufuni hiện có, không thêm MCP vào storefront.
+  Source đã kiểm tra cho thấy NextAuth của Halifruit hiện chưa cấu hình staff login
+  (`isAuthConfigured()` trả false). Vì vậy màn hình vận hành chạy ở backend Fufuni;
+  không dựng BFF giả danh nhân viên bằng admin key dùng chung.
+- Test-only entry `tests/fixtures/ctxlayer-runtime-worker.ts` chỉ được dùng bởi test
+  config tạm; production main không tham chiếu, không có route seed/bypass trong app thật.
+
+### Kiểm chứng đã chạy
+
+| Kiểm tra | Kết quả |
+|---|---|
+| ctxlayer `VITEST_MAX_WORKERS=2 bun run verify` qua RTK | Đạt typecheck/lint/unit/integration |
+| Gateway catalog integration | D1/ACL thật + SDK client/leaf transport, identity resource, session cũ bị chặn sau OFF và user suspend |
+| Pancake MCP `bun run typecheck`, `bun run test` | Đạt; catalog contract cập nhật 25 tools, tổng 166 tests |
+| Fufuni `npm run typecheck:ctxlayer`, `npm run test:ctxlayer` | Đạt; 12 test về state, CAS, mã hóa, job commit, rollback và schema |
+| Fufuni `npm run test:ctxlayer:runtime` | Đạt trên Worker/SQLite thật, OAuth issuer và MCP HTTP là fixture local |
+| Runtime trial/full/repeat | 1 → 31 → 31 sản phẩm, created counts 1 → 30 → 0; hai trang nguồn |
+| Runtime OFF/disconnect | Job thất bại, upstream read count không tăng; API catalog vẫn trả 31 sản phẩm đã lưu |
+| Hồi quy Fufuni | `test:pancake`, `test:stores`, `test:shipping`, `test:commerce` đạt |
+| Halifruit | Jest `src/lib/fufuni/fufuni.test.ts --runInBand` đạt, không sửa source frontend |
+| Fufuni Worker dry-run | Đạt với config Halifruit; không deploy |
+| Probe workerd → Gateway HTTPS local | Metadata trả HTTP 200, không tắt kiểm tra TLS |
+
+Runtime fixture kiểm tra PKCE/refresh/identity và đường HTTP đến database; test
+Gateway riêng dùng proxy/policy production. Chưa chạy một acceptance có browser,
+IdP thật, integration principal thật và API shop thật trên cùng một chain.
+Không tính fixture là bằng chứng đã đồng bộ dữ liệu khách hàng thật.
+
+Windows Application Control chặn workerd cũ đi kèm Wrangler 4.90.1. Đã nâng
+dev dependency merchant lên Wrangler **4.120.1** và workers-types **5.20260804.1**
+(SDK MCP client ghim **1.29.0**), cập nhật npm lockfile và chạy lại runtime/dry-run.
+Không thay đổi chính sách Windows. Full `tsc -p tsconfig.json` Fufuni còn lỗi nền
+ở AI tokens/categories/checkout/orders; typecheck phạm vi tích hợp đã đạt.
+
+### Chạy lại và cấu hình tài khoản thật trên local
+
+1. Khởi động lại Pancake MCP bằng source mới; refresh catalog trong ctxlayer.
+   Catalog mới có 25 tools, gồm `read_catalog_snapshot`.
+2. Tạo/chọn integration user trong ctxlayer; gán Team/Product và visibility của
+   `up-pancake-pos`; ghi user ID vào `CTXLAYER_PRINCIPAL_ID` ở Fufuni.
+3. Invocation policy của upstream chọn Product đó, chỉ allow tool
+   `read_catalog_snapshot`, action `page`, resource argument `warehouse_id`
+   là ID kho thực tế đã cấu hình. User tích hợp phải thuộc Team của Product.
+4. Cấu hình private Fufuni `.dev.vars`: source `ctxlayer_mcp`, MCP flag true,
+   Gateway URL, slug, principal ID, shop/kho và token encryption key.
+   Redirect URI dùng `http://localhost:8788/v1/integrations/ctxlayer/callback`
+   cho default store; store khác dùng prefix `/stores/<id>` tương ứng.
+   Giữ `PANCAKE_SYNC_ENABLED=false` cho tới khi trial/full được nghiệm thu.
+5. Fufuni local database cần currency VND active/decimal_places=0 và region phù hợp
+   theo provisioning có sẵn. Không chạy script init với URL backend production mặc định.
+6. Chạy `rtk npm run dev:halifruit:local` từ `fufuni/apps/merchant`; mở
+   `http://localhost:8788/v1/integrations/ctxlayer/setup`. Dùng staff JWT có quyền
+   admin store để provision. Đăng nhập ctxlayer bằng đúng integration user;
+   principal khác bị từ chối khi đọc identity resource.
+7. Trial một sản phẩm, kiểm tra report và API DB; full/repeat; sau đó mới bật cron.
+   Disconnect xóa credential local và chặn run mới; response ghi rõ chưa revoke
+   issuer grant từ xa. Muốn thu hồi grant hoàn toàn, dùng quản trị grants ctxlayer.
+8. Halifruit local đặt `FUFUNI_BACKEND_URL=http://localhost:8788` và public key
+   của đúng local database. Trang sản phẩm tiếp tục dùng API Fufuni hiện có.
+
+```powershell
+# Từ fufuni/apps/merchant, không cần credential Pancake thật cho các fixture tests
+rtk npm run typecheck:ctxlayer
+rtk npm run test:ctxlayer
+rtk npm run test:ctxlayer:runtime
+rtk proxy node scripts/probe-ctxlayer-local.mjs https://localhost:8787
+```
+
+### Giới hạn và bàn giao
+
+- Còn nghiệm thu IdP/browser thật và provider read-only với tài khoản/shop đã cấu hình.
+  Không có remote Cloudflare deploy, remote migration hay provider mutation trong đợt này.
+- Chưa thêm incremental sync, durable queue executor, retention/cleanup run history
+  hoặc keyring nhiều encryption versions. Full snapshot vẫn chịu giới hạn cũ;
+  run quá lease sẽ không được commit. Quy mô lớn cần phase staging/checkpoint riêng.
+- Không cache OAuth secret hoặc connection trong biến global. Disconnect local được
+  kiểm tra lại khi commit; không tuyên bố atomic revocation giữa Gateway và Fufuni.
+- Thay đổi Fufuni được giữ trong working tree để không gom các file nền chưa commit
+  của người dùng vào một PR không thể review. Bản đối chiếu trước khi sửa nằm ở
+  `C:/Users/ADMIN/AppData/Local/Temp/kedi-sync-baseline-20261016/fufuni`.
+- Nhánh Fufuni: `codex/ctxlayer-catalog-sync`; bản patch chỉ phần tích hợp so với
+  baseline hiện có: `C:/Users/ADMIN/AppData/Local/Temp/kedi-sync-baseline-20261016/fufuni/fufuni-agent-changes.patch`.
+  Patch này cần nền working tree trước tác vụ, không áp dụng riêng lên Git main sạch.
+- Pancake MCP đã commit `ebb7071` trên `codex/catalog-snapshot-tool`. Push bị GitHub
+  từ chối HTTP 403: tài khoản `phuongnguyen240805` chưa có quyền ghi repo
+  `nguyennguyenit/pancake-pos-mcp`. Commit và code local vẫn còn nguyên; chưa có PR
+  Pancake, không tự đổi remote hoặc dùng tài khoản khác.
+- Gateway/report: [PR #6](https://github.com/phuongnguyen240805/MCP-manager/pull/6),
+  stacked trên plan PR #5. PR này chỉ chứa thay đổi trong ctxlayer; backend Fufuni
+  và tool Pancake phải được bàn giao cùng để chạy luồng mới.
