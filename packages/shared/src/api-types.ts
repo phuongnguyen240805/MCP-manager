@@ -88,3 +88,9 @@ export const ConfigResponse = z.object({
 })
 export type ConfigResponse = z.infer<typeof ConfigResponse>
 export { InvocationPolicyResponse, PutInvocationPolicyRequest } from './invocation-policy'
+export {
+  RequestOperation,
+  OperationView,
+  OperationsResponse,
+  OperationDecision
+} from './operations'

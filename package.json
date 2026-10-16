@@ -18,6 +18,9 @@
   "scripts": {
     "dev": "concurrently -n worker,web -c blue,green \"bun --filter='@ctxlayer/worker' run dev\" \"bun --filter='@ctxlayer/web' run dev\"",
     "dev:worker": "bun --filter='@ctxlayer/worker' run dev",
+    "dev:worker:local": "bun --filter='@ctxlayer/worker' run dev:local",
+    "dev:local": "concurrently -n worker,web -c blue,green \"bun run dev:worker:local\" \"bun run dev:web\"",
+    "dev:mcp-fixture": "bun apps/worker/test/fixtures/mcp-local.mjs",
     "dev:web": "bun --filter='@ctxlayer/web' run dev",
     "build": "bun --filter='@ctxlayer/web' run build && bun --filter='@ctxlayer/worker' run build",
     "build:web": "bun --filter='@ctxlayer/web' run build",
@@ -34,6 +37,7 @@
     "verify": "bun run typecheck && bun run lint && bun run test && bun run test:int",
     "verify:full": "bun run verify && bun run smoke",
     "smoke": "bun ./scripts/smoke.mjs",
+    "smoke:kedi-local": "bun ./scripts/smoke-kedi-local.mjs",
     "bootstrap": "bun ./scripts/bootstrap-resources.mjs",
     "migrate:local": "wrangler d1 migrations apply DB --local",
     "migrate:remote": "wrangler d1 migrations apply DB --remote",

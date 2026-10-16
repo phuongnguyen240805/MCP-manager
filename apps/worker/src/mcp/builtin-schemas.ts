@@ -11,13 +11,16 @@
  * no arguments simply have no entry.
  */
 import { z } from 'zod'
-import { SearchScope } from '@ctxlayer/shared'
+import { SearchScope, RequestOperation, OperationId } from '@ctxlayer/shared'
 import { SEARCH_K_MAX } from '../rag/search'
 
 // Per-tool zod raw shapes — spread into `registerTool`'s `inputSchema`.
 // `satisfies` (not a wide annotation) keeps each shape's PRECISE type so the
 // SDK can infer the handler's `args`; the `Record` check still guards the form.
 export const BUILTIN_INPUT_SHAPES = {
+  request_operation: RequestOperation.shape,
+  get_operation: { operation_id: OperationId },
+  execute_operation: { operation_id: OperationId },
   describe_upstream: {
     slug: z
       .string()
@@ -71,15 +74,14 @@ export const BUILTIN_INPUT_SHAPES = {
     upstreams: z
       .array(z.string())
       .min(1)
-      .describe('Upstream slugs to draft against (e.g. ["up-ado","up-driver"]), from list_upstreams.'),
+      .describe(
+        'Upstream slugs to draft against (e.g. ["up-ado","up-driver"]), from list_upstreams.'
+      ),
     intent: z
       .string()
       .optional()
       .describe('What the skill should help with. Omit to let the model propose one.'),
-    tool: z
-      .string()
-      .optional()
-      .describe('Optional native tool name to focus the skill on.')
+    tool: z.string().optional().describe('Optional native tool name to focus the skill on.')
   },
   save_draft_skill: {
     title: z.string().min(1).max(200).describe('Human display label for the skill (40-100 chars).'),

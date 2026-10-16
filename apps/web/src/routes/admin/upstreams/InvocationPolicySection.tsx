@@ -113,8 +113,8 @@ export function InvocationPolicySection({
           scope is fixed by the connector instead of a tool argument.
         </Text>
         <Text size="xs" c="dimmed">
-          Approval-required rules block execution until a verified approval flow is available.
-          Saving a policy cannot revert to legacy access.
+          Approval-required rules use an operation request and approval from a different project
+          admin before execution. Saving a policy cannot revert to legacy access.
         </Text>
         <Button onClick={() => void save()} loading={busy} disabled={!snapshot || !productId}>
           Save invocation policy

@@ -654,7 +654,10 @@ export class UpstreamProxyRegistry {
         if (!authorization.allowed) {
           status = 'error'
           errorCode = authorization.code
-          errorDetail = `${authorization.code}: invocation blocked by current policy`
+          errorDetail =
+            authorization.code === 'approval_required'
+              ? 'approval_required: propose this exact action with request_operation and a stable requestId; a different project admin must approve it before execute_operation.'
+              : `${authorization.code}: invocation blocked by current policy`
           return errText(errorDetail)
         }
         const activeConn = authorization.conn
