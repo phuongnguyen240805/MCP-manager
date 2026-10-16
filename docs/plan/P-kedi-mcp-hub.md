@@ -1,6 +1,47 @@
 # P — KEDI MCP Hub: kế hoạch kiến trúc và triển khai
 
-Ngày lập: 2026-10-16. Trạng thái: **kế hoạch đề xuất, chưa triển khai**.
+Ngày lập: 2026-10-16. Trạng thái: **đang triển khai; chưa nghiệm thu toàn bộ**.
+
+### Tiến độ triển khai 2026-10-16
+
+Đợt đầu triển khai authorization gate dùng chung cho session cũ và queue,
+lọc discovery và quyền đọc lại job, cấu hình policy qua API/Dashboard,
+resource allowlist và rotation credential. Policy được lưu có version/CAS.
+MCP mới tạo mặc định Disabled. Upstream cũ chưa cấu hình policy vẫn dùng
+visibility/tool ACL cũ; Dashboard hiển thị cảnh báo Legacy access.
+
+Quyết định chi tiết: tái sử dụng `products` và membership thông qua Team làm
+project scope; không tạo bảng projects/membership song song. Một upstream
+đã có policy được gắn một product và resource allowlist; các shop có credential
+khác nhau đăng ký connection/upstream riêng. Mỗi doanh nghiệp vẫn dùng deployment riêng.
+
+| Phase | Trạng thái thực tế |
+|---|---|
+| 0 | Đã khảo sát source/bindings và baseline; chưa có tenant/shop sandbox được xác nhận |
+| 1 | Có fake transport + D1 integration tests; chưa xác nhận Pancake thật/OAuth client thật |
+| 2 | Đã triển khai enforcement, API và UI; verify, build và smoke local đạt; chưa nghiệm thu connector thật |
+| 3 | Chưa triển khai approval/operation ledger; `approval_required` hiện luôn chặn |
+| 4 | Đã test cách ly hai upstream bằng fixture; chưa onboard Meta/Google thật |
+| 5–7 | Chưa provision/deploy Cloudflare hoặc triển khai Agent Runtime |
+
+Migration mới: `0041_invocation_policy.sql`. Queue persist thêm args để đọc
+kết quả theo đúng invocation; message bị sửa args/identity bị từ chối theo
+job key đã lưu. Việc này chưa thay thế execution lease/idempotency của phase 3.
+Chỉ áp dụng migration local bằng script local, không tự chạy migrate remote.
+
+Validation đợt đầu: `VITEST_MAX_WORKERS=2 bun run verify` đạt (PowerShell đặt
+biến môi trường trước lệnh); bộ mục tiêu backend/security 337 test và UI 3 test đạt;
+`bun run build` đạt; `bun run smoke https://localhost:8787` đạt 11/11.
+Giới hạn test worker tránh timeout của test archive 80 MiB trên máy Windows;
+không tăng timeout hoặc bỏ kiểm thử. Đây là smoke hạ tầng/auth/SPA, không phải
+bằng chứng gọi Pancake/Meta/Google thật. RAG/AI và OAuth provider thật chưa nghiệm thu.
+
+Gate còn thiếu: repo Pancake bên cạnh chưa có `.dev.vars`/`.env`, và process
+hiện tại chưa cấu hình `PANCAKE_POS_API_KEY`, `PANCAKE_POS_SHOP_ID`, `MCP_AUTH_TOKEN`.
+Cần người vận hành cấu hình credential sandbox trong file bị gitignore hoặc
+secret store (không gửi giá trị qua chat), xác nhận shop/project dùng thử, rồi
+nghiệm thu read-only qua Hub trước khi mở phase ghi dữ liệu. Staging cần chốt
+account/domain và tài nguyên riêng; đợt này chưa deploy hoặc migrate remote.
 
 Tài liệu này là kế hoạch riêng cho KEDI, không thay thế `docs/PLAN.md`.
 Các checkbox biểu thị công việc cần làm; việc có tên file trong cây đề xuất

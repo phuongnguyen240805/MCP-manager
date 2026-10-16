@@ -25,6 +25,7 @@ import { PrivateSection } from './PrivateSection'
 import { ToolsCacheSection } from './ToolsCacheSection'
 import { ToolAccessSection } from './ToolAccessSection'
 import { VisibilitySection } from './VisibilitySection'
+import { InvocationPolicySection } from './InvocationPolicySection'
 
 export function UpstreamDrawer({
   upstreamId,
@@ -170,6 +171,8 @@ export function UpstreamDrawer({
             }
           />
         )}
+
+        <InvocationPolicySection key={row.id} upstreamId={row.id} products={products} />
 
         <ConnectionSection
           row={row}

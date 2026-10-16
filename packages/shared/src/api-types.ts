@@ -87,3 +87,4 @@ export const ConfigResponse = z.object({
   accessSso: z.boolean().optional()
 })
 export type ConfigResponse = z.infer<typeof ConfigResponse>
+export { InvocationPolicyResponse, PutInvocationPolicyRequest } from './invocation-policy'

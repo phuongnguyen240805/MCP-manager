@@ -22,6 +22,7 @@ import {
 } from '../db/queries/products'
 import { notFound, parseJsonBody } from './respond'
 import { isUniqueViolation } from '../db/queries/util'
+import { projectHasInvocationPolicies } from '../db/queries/invocation-policies'
 
 export const adminProductsRoute = new Hono<{ Bindings: Env; Variables: AuthedVariables }>()
 adminProductsRoute.use('*', requireAdmin)
@@ -70,6 +71,15 @@ adminProductsRoute.patch('/:id', async (c) => {
 adminProductsRoute.delete('/:id', async (c) => {
   const id = c.req.param('id')
   const row = await getProductById(c.env, id)
+  if (await projectHasInvocationPolicies(c.env, id)) {
+    return c.json(
+      {
+        error: 'project_in_use',
+        message: 'Reassign upstream invocation policies before deleting this project.'
+      },
+      409
+    )
+  }
   await deleteProduct(c.env, id)
   if (row) {
     await audit(c.env, {

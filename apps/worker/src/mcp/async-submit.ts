@@ -9,11 +9,7 @@
 
 import type { Env } from '../env'
 import type { UpstreamConnection } from '../db/queries/upstreams'
-import {
-  findLatestJobByKey,
-  insertRunningJob,
-  supersedeRunningJob
-} from '../db/queries/async-jobs'
+import { findLatestJobByKey, insertRunningJob, supersedeRunningJob } from '../db/queries/async-jobs'
 import { errMessage } from '../util/errors'
 import { safeJson } from './tool-result'
 
@@ -130,7 +126,8 @@ export async function submitAsyncJob(
       upstreamId: conn.id,
       tool: upstreamToolName,
       jobKey,
-      createdAt: now
+      createdAt: now,
+      argsJson
     })
   } catch (err) {
     // Lost the race to a concurrent submit that took the running slot.

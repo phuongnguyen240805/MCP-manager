@@ -37,10 +37,7 @@ import {
   toUpstreamConnection
 } from '../db/queries/upstreams'
 import { listCachedTools } from '../db/queries/upstream-tools'
-import {
-  deleteSharedCredential,
-  upsertSharedCredential
-} from '../db/queries/upstream-credentials'
+import { deleteSharedCredential, upsertSharedCredential } from '../db/queries/upstream-credentials'
 import { refreshCatalogueForConnection, warmCatalogueAndLog } from '../upstream/catalogue'
 import { resolveUserUpstreamBearer } from '../upstream/bearer'
 import {
@@ -56,10 +53,12 @@ import { listToolAccessForUpstream, replaceToolAccessForTool } from '../db/queri
 import { buildUpstreamToolsPayload } from './upstreams-attachments'
 import { notFound, parseJsonBody } from './respond'
 import { isUniqueViolation } from '../db/queries/util'
+import { invocationPolicyRoute } from './invocation-policy'
 
 export const adminUpstreamsRoute = new Hono<{ Bindings: Env; Variables: AuthedVariables }>()
 adminUpstreamsRoute.use('*', requireAdmin)
 adminUpstreamsRoute.use('*', requireCsrf)
+adminUpstreamsRoute.route('/:id/invocation-policy', invocationPolicyRoute)
 
 // Refusal for org-scoping writes (grants, per-tool ACL) on a private
 // upstream: its owner is its whole audience, so a rule could only widen it.
@@ -93,7 +92,10 @@ adminUpstreamsRoute.post('/', async (c) => {
   // would call into itself. Enforced here, not in the shared schema,
   // which can't see env.
   if (isSameOrigin(input.url, c.env.PUBLIC_BASE_URL)) {
-    return c.json({ error: 'self_loop', message: 'URL must not point at this ctxlayer instance' }, 400)
+    return c.json(
+      { error: 'self_loop', message: 'URL must not point at this ctxlayer instance' },
+      400
+    )
   }
   if (oauthEndpointSelfLoop(input.authConfig, c.env)) {
     return c.json(
@@ -114,7 +116,7 @@ adminUpstreamsRoute.post('/', async (c) => {
           c.env,
           undefined
         )) ?? {},
-      enabled: input.enabled ?? true,
+      enabled: input.enabled ?? false,
       ownerUserId: input.private ? c.get('user').userId : null
     })
     // For unauth (`none`) upstreams there's nothing to wait for —
@@ -154,7 +156,10 @@ adminUpstreamsRoute.patch('/:id', async (c) => {
   const parsed = await parseJsonBody(c, UpdateUpstreamRequest)
   if (!parsed.ok) return parsed.res
   if (parsed.data.url && isSameOrigin(parsed.data.url, c.env.PUBLIC_BASE_URL)) {
-    return c.json({ error: 'self_loop', message: 'URL must not point at this ctxlayer instance' }, 400)
+    return c.json(
+      { error: 'self_loop', message: 'URL must not point at this ctxlayer instance' },
+      400
+    )
   }
   if (oauthEndpointSelfLoop(parsed.data.authConfig, c.env)) {
     return c.json(
@@ -420,4 +425,3 @@ adminUpstreamsRoute.delete('/:id/shared-credentials', async (c) => {
   })
   return new Response(null, { status: 204 })
 })
-
