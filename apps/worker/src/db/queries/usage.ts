@@ -29,8 +29,9 @@ export async function writeUsageEvent(env: Env, e: UsageEventMsg): Promise<void>
       `INSERT INTO usage_events
          (id, ts, user_id, session_id, upstream_id, tool,
           req_bytes, resp_bytes, req_tokens, resp_tokens,
-          latency_ms, status, truncated, error_code, error_message)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`
+          latency_ms, status, truncated, error_code, error_message, tenant_id)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+               (SELECT tenant_id FROM users WHERE id = ?3))`
     ).bind(
       e.id,
       e.ts,
@@ -52,8 +53,9 @@ export async function writeUsageEvent(env: Env, e: UsageEventMsg): Promise<void>
       `INSERT INTO usage_rollups_daily
          (day, user_id, upstream_id, tool,
           calls, req_bytes, resp_bytes, req_tokens, resp_tokens,
-          errors, timeouts, truncations)
-       VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+          errors, timeouts, truncations, tenant_id)
+       VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+               (SELECT tenant_id FROM users WHERE id = ?2))
        ON CONFLICT(day, user_id, upstream_id, tool) DO UPDATE SET
          calls       = calls       + 1,
          req_bytes   = req_bytes   + excluded.req_bytes,

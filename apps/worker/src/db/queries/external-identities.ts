@@ -1,9 +1,12 @@
 /**
  * Map a trusted-gateway (issuer, subject) onto a local user.
  *
- * Lookup is only the external_identities primary key. Email is a synthetic
- * `kedi.<hash>@gateway.invalid` so UNIQUE(users.email) cannot attach this
- * subject to a human who signed in with Google, GitHub, or Access.
+ * Lookup is the external_identities primary key (issuer, subject, tenant).
+ * The same Nest subject in two tenants is two local users, so a role flip
+ * cannot cross tenants. Email is a synthetic `kedi.<hash>@gateway.invalid`
+ * (the hash includes the tenant) so UNIQUE(users.email) cannot attach this
+ * subject to a human who signed in with Google, GitHub, or Access, or to
+ * the same subject in another tenant.
  * `hub_role` is applied on every assertion: admin only while the claim
  * says admin. A locally suspended row stays suspended.
  */
@@ -17,10 +20,10 @@ const USER_COLUMNS = `id, email, name, avatar_url, idp, idp_sub, role, status, c
 
 export async function resolveGatewayUser(
   env: Env,
-  input: { issuer: string; subject: string; hubRole: 'member' | 'admin' }
+  input: { issuer: string; subject: string; tenantId: string; hubRole: 'member' | 'admin' }
 ): Promise<{ user: UserRow } | { inactive: true }> {
   const role: Role = input.hubRole === 'admin' ? 'admin' : 'user'
-  const existing = await findGatewayUser(env, input.issuer, input.subject)
+  const existing = await findGatewayUser(env, input.issuer, input.subject, input.tenantId)
   if (existing) return activateRole(env, existing, role)
 
   try {
@@ -30,7 +33,7 @@ export async function resolveGatewayUser(
     // re-reads. Any other unique hit (email) is NOT treated as a match.
     if (!isUniqueViolation(err)) throw err
   }
-  const row = await findGatewayUser(env, input.issuer, input.subject)
+  const row = await findGatewayUser(env, input.issuer, input.subject, input.tenantId)
   if (!row) throw new Error('gateway_user_insert_failed')
   return activateRole(env, row, role)
 }
@@ -48,38 +51,46 @@ async function activateRole(
   return { user: row }
 }
 
-async function findGatewayUser(env: Env, issuer: string, subject: string): Promise<UserRow | null> {
+async function findGatewayUser(
+  env: Env,
+  issuer: string,
+  subject: string,
+  tenantId: string
+): Promise<UserRow | null> {
   const row = await env.DB.prepare(
     `SELECT ${USER_COLUMNS}
      FROM users
      WHERE id = (
-       SELECT user_id FROM external_identities WHERE issuer = ?1 AND subject = ?2
+       SELECT user_id FROM external_identities
+       WHERE issuer = ?1 AND subject = ?2 AND tenant_id = ?3
      )`
   )
-    .bind(issuer, subject)
+    .bind(issuer, subject, tenantId)
     .first<UserRow>()
   return row ?? null
 }
 
 async function insertGatewayUser(
   env: Env,
-  input: { issuer: string; subject: string },
+  input: { issuer: string; subject: string; tenantId: string },
   role: Role
 ): Promise<void> {
   const id = newId()
-  const key = await sha256Hex(`${input.issuer}\n${input.subject}`)
+  // Tenant is part of the hash so two tenants cannot collide on users.email
+  // and cannot attach to each other's row.
+  const key = await sha256Hex(`${input.issuer}\n${input.subject}\n${input.tenantId}`)
   const now = Math.floor(Date.now() / 1000)
   const email = `kedi.${key}@gateway.invalid`
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO users
-         (id, email, name, avatar_url, idp, idp_sub, role, status, created_at, last_seen_at)
-       VALUES (?1, ?2, ?3, NULL, 'kedi', ?4, ?5, 'active', ?6, ?6)`
-    ).bind(id, email, displaySubject(input.subject), key, role, now),
+         (id, email, name, avatar_url, idp, idp_sub, role, status, created_at, last_seen_at, tenant_id)
+       VALUES (?1, ?2, ?3, NULL, 'kedi', ?4, ?5, 'active', ?6, ?6, ?7)`
+    ).bind(id, email, displaySubject(input.subject), key, role, now, input.tenantId),
     env.DB.prepare(
-      `INSERT INTO external_identities (issuer, subject, user_id, created_at)
-       VALUES (?1, ?2, ?3, ?4)`
-    ).bind(input.issuer, input.subject, id, now)
+      `INSERT INTO external_identities (issuer, subject, tenant_id, user_id, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5)`
+    ).bind(input.issuer, input.subject, input.tenantId, id, now)
   ])
 }
 

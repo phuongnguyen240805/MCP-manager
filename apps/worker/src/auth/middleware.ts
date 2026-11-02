@@ -9,12 +9,9 @@ import {
 } from './session'
 import { csrfSetCookie, newCsrfToken } from './csrf'
 import { accessTrustConfigured, verifyCfAccessJwt } from './cf-access'
-import {
-  consumeGatewayJti,
-  decideGateway,
-  safeRid
-} from './kedi-gateway'
+import { consumeGatewayJti, decideGateway, safeRid } from './kedi-gateway'
 import { resolveGatewayUser } from '../db/queries/external-identities'
+import { runWithGatewayTenant } from '../db/tenant-db'
 import { EmailOnOtherIdpError, findById, upsertUser, type UserRow } from '../db/queries/users'
 import { errMessage } from '../util/errors'
 import type { Role } from '@ctxlayer/shared'
@@ -47,7 +44,7 @@ type Ctx = AuthedContext
  */
 async function resolveActiveUser(
   c: Ctx
-): Promise<{ user: SessionUser; row: UserRow } | { error: Response }> {
+): Promise<{ user: SessionUser; row: UserRow; tenantId?: string } | { error: Response }> {
   // 0. Trusted gateway bearer. Only when KEDI_GATEWAY_* is configured AND
   //    the request presents Authorization: Bearer. No cookie is minted.
   //    A presented bearer that fails does not fall through to the cookie.
@@ -89,7 +86,7 @@ async function resolveActiveUser(
  */
 async function resolveFromGateway(
   c: Ctx
-): Promise<{ user: SessionUser; row: UserRow } | { error: Response } | null> {
+): Promise<{ user: SessionUser; row: UserRow; tenantId: string } | { error: Response } | null> {
   const decision = await decideGateway(c.req.raw, c.env)
   if (decision.kind === 'skip') return null
   if (decision.kind === 'reject') {
@@ -102,6 +99,7 @@ async function resolveFromGateway(
     resolved = await resolveGatewayUser(c.env, {
       issuer: decision.claims.iss,
       subject: decision.claims.sub,
+      tenantId: decision.claims.tid,
       hubRole: decision.claims.hubRole
     })
   } catch (err) {
@@ -115,13 +113,25 @@ async function resolveFromGateway(
 
   const consumed = await consumeGatewayJti(c.env, decision.claims)
   if (consumed !== 'ok') {
-    console.warn(
-      `[kedi-gateway] reject reason=${consumed} rid=${safeRid(decision.claims.rid)}`
-    )
+    console.warn(`[kedi-gateway] reject reason=${consumed} rid=${safeRid(decision.claims.rid)}`)
     return { error: c.json({ error: 'not_signed_in' }, 401) }
   }
   const row = resolved.user
-  return { user: { userId: row.id, role: row.role }, row }
+  return { user: { userId: row.id, role: row.role }, row, tenantId: decision.claims.tid }
+}
+
+function continueAuthed(
+  c: Ctx,
+  resolved: { user: SessionUser; row: UserRow; tenantId?: string },
+  next: () => Promise<void>
+): Promise<void> {
+  c.set('user', resolved.user)
+  c.set('userRow', resolved.row)
+  // Scope only the gateway request. Cookie and Access sessions stay on the
+  // unpartitioned deployment org, which is every row that existed before
+  // tenant_id was added.
+  if (resolved.tenantId) return runWithGatewayTenant(resolved.tenantId, () => next())
+  return next()
 }
 
 /**
@@ -198,9 +208,7 @@ export const requireUser: MiddlewareHandler<{
 }> = async (c, next) => {
   const resolved = await resolveActiveUser(c)
   if ('error' in resolved) return resolved.error
-  c.set('user', resolved.user)
-  c.set('userRow', resolved.row)
-  await next()
+  return continueAuthed(c, resolved, next)
 }
 
 /** Same as requireUser, but additionally requires role==='admin'. */
@@ -211,7 +219,5 @@ export const requireAdmin: MiddlewareHandler<{
   const resolved = await resolveActiveUser(c)
   if ('error' in resolved) return resolved.error
   if (resolved.user.role !== 'admin') return c.json({ error: 'forbidden' }, 403)
-  c.set('user', resolved.user)
-  c.set('userRow', resolved.row)
-  await next()
+  return continueAuthed(c, resolved, next)
 }

@@ -162,9 +162,16 @@ any of these on a new endpoint or proxy hop is a regression.
   succeed. A bearer that does not verify must not skip CSRF, and must
   not fall through to the session cookie. Replay (`jti` in `OAUTH_KV`)
   is enforced in `requireUser`. Unset gateway env leaves the path off.
+  A verified assertion also partitions that request: reads and writes of
+  partitioned tables (`documents`, `skills`, `upstream_servers`, `users`,
+  usage, audit, …) see only rows with `tenant_id` equal to `tid`
+  (migration `0044_gateway_tenant`). Cookie, Access, MCP, queue, and cron
+  paths do not enter that scope.
 - **`listDocs` returns every non-deleted doc to every signed-in user
   by design.** This is the org-IA "open-read" stance — docs are
   readable org-wide; tags organize and narrow, they do not gate reads.
+  A Kedi gateway request is the exception: open-read applies inside the
+  assertion's tenant only.
   **Search follows the same stance: `search_docs` + `/api/search`
   default to open-read (all docs).** `effectiveScope(undefined)` →
   `all: true`; an explicit `scope: { teams, products }` NARROWS

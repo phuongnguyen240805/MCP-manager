@@ -22,6 +22,7 @@ import { errMessage } from './util/errors'
 import { keepWarmUserCredentials } from './upstream/keep-warm'
 import { recordJobRun } from './ops/job-runs'
 import { pruneJobRuns } from './db/queries/job-runs'
+import { withTenantAwareEnv } from './db/tenant-db'
 
 export { McpSessionDO } from './mcp/session-do'
 export { DocRoomDO } from './collab/doc-room-do'
@@ -55,10 +56,11 @@ const worker: ExportedHandler<Env> = {
     // configured, the browser host 404s /mcp,/sse,/cli instead of answering
     // with a confusing `invalid_token` (a past-Access user has no MCP bearer).
     // No-op for single-host deployments. See util/mcp-host.ts.
-    if (isMcpPathOnWrongHost(req, env)) {
+    const bound = withTenantAwareEnv(env)
+    if (isMcpPathOnWrongHost(req, bound)) {
       return withHsts(req, Response.json({ error: 'not_found' }, { status: 404 }))
     }
-    return withHsts(req, await buildOAuthProvider(env).fetch(req, env, ctx))
+    return withHsts(req, await buildOAuthProvider(bound).fetch(req, bound, ctx))
   },
   async queue(batch, env, ctx) {
     // Match on the type SUFFIX, not an exact name: queue names are

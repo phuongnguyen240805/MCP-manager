@@ -138,9 +138,11 @@ export async function findRedeemableJoinCode(
   now: number = Math.floor(Date.now() / 1000)
 ): Promise<RedeemResult> {
   const hash = await sha256Hex(normalizeCode(code))
+  // Cookie admission only — see findUnredeemedInvite. Gateway codes are
+  // partitioned and are not redeemable on the deployment sign-in path.
   const row = await env.DB.prepare(
     `SELECT id, on_redeem, domain_restrict, max_uses, uses, expires_at, revoked_at
-     FROM join_codes WHERE code_hash = ?1`
+     FROM join_codes WHERE code_hash = ?1 AND tenant_id IS NULL`
   )
     .bind(hash)
     .first<{
