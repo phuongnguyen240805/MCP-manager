@@ -243,3 +243,108 @@ ACCESS_POLICY = "open_domain"        # open_domain | request | invite
 # already in use") — the same trap now applies in reverse to
 # ALLOWED_GITHUB_USERS, so delete any old ALLOWED_GITHUB_USERS secret before the
 # first deploy that injects the var.
+
+# ---------------------------------------------------------------------------
+# Dev worker (`wrangler deploy --env dev`). Bindings are NOT inherited, so
+# this block repeats them. D1 + KV ids are the all-zero placeholders
+# `bun run bootstrap -- --env dev` provisions on the operator's own account
+# and writes back here. R2 / Vectorize / queue NAMES match the top-level
+# worker; they are account-global, so this environment belongs on an account
+# that does not already host production ctxlayer. Do not put real secrets in
+# this file. Local `wrangler dev` (no --env) keeps using the top-level
+# bindings and `.dev.vars`.
+# ---------------------------------------------------------------------------
+
+[env.dev]
+name = "ctxlayer-dev"
+
+[env.dev.vars]
+PUBLIC_BASE_URL = "https://ctxlayer-dev.example.workers.dev"
+GIT_SHA = ""
+BUILT_AT = ""
+GATEWAY_ALIAS = ""
+ALLOWED_GOOGLE_HD = ""
+ALLOWED_GOOGLE_EMAILS = ""
+ALLOWED_GITHUB_ORG = ""
+ALLOWED_GITHUB_USERS = ""
+ACCESS_POLICY = "open_domain"
+
+[[env.dev.d1_databases]]
+binding = "DB"
+database_name = "ctxlayer-dev"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "apps/worker/src/db/migrations"
+
+[[env.dev.kv_namespaces]]
+binding = "OAUTH_KV"
+id = "00000000000000000000000000000000"
+
+[[env.dev.r2_buckets]]
+binding = "DOCS_BUCKET"
+bucket_name = "ctxlayer-docs"
+
+[[env.dev.vectorize]]
+binding = "DOCS_INDEX"
+index_name = "ctxlayer-docs"
+
+[[env.dev.vectorize]]
+binding = "DOCS_LEXICAL_INDEX"
+index_name = "ctxlayer-docs-lexical"
+
+[env.dev.ai]
+binding = "AI"
+
+[[env.dev.durable_objects.bindings]]
+name = "MCP_SESSION_DO"
+class_name = "McpSessionDO"
+
+[[env.dev.durable_objects.bindings]]
+name = "DOC_ROOM_DO"
+class_name = "DocRoomDO"
+
+# Fresh script: environment migrations replace the top-level list (they are
+# not appended). Same end state as the root [[migrations]] tag.
+[[env.dev.migrations]]
+tag = "v1"
+new_classes = ["DocRoomDO"]
+new_sqlite_classes = ["McpSessionDO"]
+
+[[env.dev.queues.producers]]
+binding = "USAGE_QUEUE"
+queue = "ctxlayer-usage"
+
+[[env.dev.queues.producers]]
+binding = "DOC_REINDEX_QUEUE"
+queue = "ctxlayer-reindex"
+
+[[env.dev.queues.producers]]
+binding = "GIT_SYNC_QUEUE"
+queue = "ctxlayer-git-sync"
+
+[[env.dev.queues.producers]]
+binding = "JOBS_QUEUE"
+queue = "ctxlayer-jobs"
+
+[[env.dev.queues.consumers]]
+queue = "ctxlayer-usage"
+max_batch_size = 100
+max_batch_timeout = 5
+max_retries = 5
+
+[[env.dev.queues.consumers]]
+queue = "ctxlayer-reindex"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 5
+
+[[env.dev.queues.consumers]]
+queue = "ctxlayer-git-sync"
+max_batch_size = 5
+max_batch_timeout = 30
+max_retries = 5
+
+[[env.dev.queues.consumers]]
+queue = "ctxlayer-jobs"
+max_batch_size = 1
+max_batch_timeout = 5
+max_retries = 3

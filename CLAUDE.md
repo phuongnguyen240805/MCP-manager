@@ -153,6 +153,15 @@ any of these on a new endpoint or proxy hop is a regression.
   than via `.use('*', requireCsrf)` (which is what `admin-teams.ts`
   uses). When adding a new mutation to an admin router, double-check
   the CSRF gate is present on that specific route.
+- **Gateway bearer skips cookie CSRF only after the JWT verifies.**
+  When `KEDI_GATEWAY_ISSUER`, `KEDI_GATEWAY_AUDIENCE`,
+  `KEDI_GATEWAY_PUBLIC_JWK`, and `KEDI_GATEWAY_ALLOWED_TENANTS` are all
+  set, `Authorization: Bearer` on `/api/*` is a Nest assertion
+  (`auth/kedi-gateway.ts`). `requireCsrf` skips the double-submit check
+  only after signature, issuer, audience, lifetime, and tenant checks
+  succeed. A bearer that does not verify must not skip CSRF, and must
+  not fall through to the session cookie. Replay (`jti` in `OAUTH_KV`)
+  is enforced in `requireUser`. Unset gateway env leaves the path off.
 - **`listDocs` returns every non-deleted doc to every signed-in user
   by design.** This is the org-IA "open-read" stance — docs are
   readable org-wide; tags organize and narrow, they do not gate reads.

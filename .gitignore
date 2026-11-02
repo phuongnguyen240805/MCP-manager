@@ -5,6 +5,8 @@ dist/
 .dev.vars
 .dev.vars.local
 .prod.vars
+# Private half of a local gateway signing key. The assertion script writes it.
+.dev-kedi-gateway-key.json
 # Per-environment rendered wrangler configs (e.g. wrangler.dev.toml), generated
 # at deploy time. The base `wrangler.toml` has no middle segment so it is NOT
 # matched and stays tracked.

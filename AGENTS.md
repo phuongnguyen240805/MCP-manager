@@ -92,7 +92,9 @@ Quick scan before opening a PR that adds a Hono route:
 
 - Mutation (`POST`/`PATCH`/`PUT`/`DELETE`)? → `requireCsrf` is on the
   route. Admin mutations also need `requireAdmin` (usually via
-  `.use('*', requireAdmin)` at the router level).
+  `.use('*', requireAdmin)` at the router level). A verified Kedi
+  gateway bearer skips that cookie check (`auth/kedi-gateway.ts`);
+  an absent or unverified bearer does not.
 - New IdP / OAuth surface? → state cookie cleared on every completion
   path (success, failure, and KV-expired fallback — see
   `idp/complete-mcp.ts`).

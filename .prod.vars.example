@@ -28,3 +28,12 @@ PUBLIC_BASE_URL=https://your-worker.workers.dev
 # when set, cron/queue/poison-message failures are POSTed here (ops/alert.ts).
 # Set via `wrangler secret put ALERT_WEBHOOK_URL`. Unset ⇒ alerting is a no-op.
 # ALERT_WEBHOOK_URL=https://hooks.slack.com/services/...
+
+# Trusted gateway (Kedi Nest). Placeholders only — never commit a real key.
+# Apply with `wrangler secret put`, not as a [vars] entry (PUBLIC_JWK collides
+# with nothing here, but it must not ride `deploy.mjs --var` on the process
+# list). Leave unset to keep the bearer path disabled.
+# KEDI_GATEWAY_ISSUER=https://kedi-gateway.example
+# KEDI_GATEWAY_AUDIENCE=ctxlayer
+# KEDI_GATEWAY_PUBLIC_JWK={"kty":"EC","crv":"P-256","kid":"placeholder","alg":"ES256","x":"placeholder","y":"placeholder"}
+# KEDI_GATEWAY_ALLOWED_TENANTS=tenant_placeholder

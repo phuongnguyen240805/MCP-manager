@@ -9,7 +9,14 @@ import {
 } from './session'
 import { csrfSetCookie, newCsrfToken } from './csrf'
 import { accessTrustConfigured, verifyCfAccessJwt } from './cf-access'
+import {
+  consumeGatewayJti,
+  decideGateway,
+  safeRid
+} from './kedi-gateway'
+import { resolveGatewayUser } from '../db/queries/external-identities'
 import { EmailOnOtherIdpError, findById, upsertUser, type UserRow } from '../db/queries/users'
+import { errMessage } from '../util/errors'
 import type { Role } from '@ctxlayer/shared'
 
 export interface SessionUser {
@@ -41,7 +48,13 @@ type Ctx = AuthedContext
 async function resolveActiveUser(
   c: Ctx
 ): Promise<{ user: SessionUser; row: UserRow } | { error: Response }> {
-  // 1. An existing session cookie wins — the cheap path, no Access/IdP work.
+  // 0. Trusted gateway bearer. Only when KEDI_GATEWAY_* is configured AND
+  //    the request presents Authorization: Bearer. No cookie is minted.
+  //    A presented bearer that fails does not fall through to the cookie.
+  const gateway = await resolveFromGateway(c)
+  if (gateway) return gateway
+
+  // 1. Session cookie. Reached only when this request is not a gateway call.
   const cookie = readSessionCookie(c.req.raw)
   const payload = await verifySession(cookie, c.env.SESSION_COOKIE_SECRET)
   if (payload) {
@@ -67,6 +80,48 @@ async function resolveActiveUser(
   }
 
   return { error: c.json({ error: 'not_signed_in' }, 401) }
+}
+
+/**
+ * Nest called `/api/*` on behalf of a user. Identity comes from the
+ * assertion, not from a browser cookie. `null` means this request is not
+ * a gateway call (mode off, or no bearer) and the cookie path should run.
+ */
+async function resolveFromGateway(
+  c: Ctx
+): Promise<{ user: SessionUser; row: UserRow } | { error: Response } | null> {
+  const decision = await decideGateway(c.req.raw, c.env)
+  if (decision.kind === 'skip') return null
+  if (decision.kind === 'reject') {
+    console.warn(`[kedi-gateway] reject reason=${decision.reason}`)
+    return { error: c.json({ error: 'not_signed_in' }, 401) }
+  }
+
+  let resolved: Awaited<ReturnType<typeof resolveGatewayUser>>
+  try {
+    resolved = await resolveGatewayUser(c.env, {
+      issuer: decision.claims.iss,
+      subject: decision.claims.sub,
+      hubRole: decision.claims.hubRole
+    })
+  } catch (err) {
+    console.error(`[kedi-gateway] identity failed: ${errMessage(err)}`)
+    return { error: c.json({ error: 'not_signed_in' }, 401) }
+  }
+  if ('inactive' in resolved) {
+    console.warn(`[kedi-gateway] reject reason=inactive rid=${safeRid(decision.claims.rid)}`)
+    return { error: c.json({ error: 'not_signed_in' }, 401) }
+  }
+
+  const consumed = await consumeGatewayJti(c.env, decision.claims)
+  if (consumed !== 'ok') {
+    console.warn(
+      `[kedi-gateway] reject reason=${consumed} rid=${safeRid(decision.claims.rid)}`
+    )
+    return { error: c.json({ error: 'not_signed_in' }, 401) }
+  }
+  const row = resolved.user
+  return { user: { userId: row.id, role: row.role }, row }
 }
 
 /**
