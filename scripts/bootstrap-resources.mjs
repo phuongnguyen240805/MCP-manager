@@ -13,6 +13,11 @@
  *
  * Requires `wrangler login` (or CLOUDFLARE_API_TOKEN + ACCOUNT_ID in
  * env). Re-run any time without harm.
+ *
+ *   bun run bootstrap                 # top-level worker (database "ctxlayer")
+ *   bun run bootstrap -- --env dev    # [env.dev] worker only (database
+ *                                     # "ctxlayer-dev"); does not rewrite the
+ *                                     # top-level ids
  */
 
 import { readFileSync, writeFileSync } from 'node:fs'
@@ -26,6 +31,13 @@ const VECTORIZE_NAME = 'ctxlayer-docs'
 const QUEUES = ['ctxlayer-usage', 'ctxlayer-reindex', 'ctxlayer-git-sync', 'ctxlayer-jobs']
 
 const PLACEHOLDER_RE = /^0+(-0+)*$/
+
+const envFlag = process.argv.indexOf('--env')
+const targetEnv = envFlag === -1 ? null : process.argv[envFlag + 1]
+if (envFlag !== -1 && targetEnv !== 'dev') {
+  console.error('bootstrap: only "--env dev" is supported (or omit --env for the top-level worker).')
+  process.exit(1)
+}
 
 let toml = readFileSync(TOML, 'utf8')
 let dirty = false
@@ -57,43 +69,61 @@ function run(args) {
 }
 
 // ----- D1 ---------------------------------------------------------------
-const dbMatch = toml.match(/\[\[d1_databases\]\][\s\S]*?database_id\s*=\s*"([0-9a-fA-F-]+)"/)
+// Top-level `[[d1_databases]]` must not match `[[env.dev.d1_databases]]`.
+const dbPattern = targetEnv
+  ? /\[\[env\.dev\.d1_databases\]\][\s\S]*?database_id\s*=\s*"([0-9a-fA-F-]+)"/
+  : /\[\[d1_databases\]\][\s\S]*?database_id\s*=\s*"([0-9a-fA-F-]+)"/
+const dbName = targetEnv ? 'ctxlayer-dev' : DB_NAME
+const dbMatch = toml.match(dbPattern)
 if (!dbMatch) {
-  console.error('Could not find d1_databases.database_id in wrangler.toml')
+  console.error(`Could not find ${targetEnv ? 'env.dev ' : ''}d1_databases.database_id in wrangler.toml`)
   process.exit(1)
 }
 const currentDbId = dbMatch[1]
 if (PLACEHOLDER_RE.test(currentDbId)) {
-  console.log(`\nProvisioning D1 database "${DB_NAME}"…`)
-  const out = run(['d1', 'create', DB_NAME])
+  console.log(`\nProvisioning D1 database "${dbName}"…`)
+  const out = run(['d1', 'create', dbName])
   const idMatch = out.match(/database_id\s*=\s*"([^"]+)"/)
   if (!idMatch) {
     console.error('Could not parse database_id from wrangler output:\n' + out)
     process.exit(1)
   }
-  patch(/database_id\s*=\s*"[^"]*"/, `database_id = "${idMatch[1]}"`, 'D1 database_id')
+  const dbPatch = targetEnv
+    ? /(\[\[env\.dev\.d1_databases\]\][\s\S]*?database_id\s*=\s*)"[^"]*"/
+    : /database_id\s*=\s*"[^"]*"/
+  const dbReplacement = targetEnv
+    ? `$1"${idMatch[1]}"`
+    : `database_id = "${idMatch[1]}"`
+  patch(dbPatch, dbReplacement, 'D1 database_id')
   console.log(`✓ D1 id: ${idMatch[1]}`)
 } else {
   console.log(`✓ D1 already provisioned (id: ${currentDbId})`)
 }
 
 // ----- KV ---------------------------------------------------------------
-const kvMatch = toml.match(/\[\[kv_namespaces\]\][\s\S]*?id\s*=\s*"([0-9a-fA-F]+)"/)
+const kvPattern = targetEnv
+  ? /\[\[env\.dev\.kv_namespaces\]\][\s\S]*?id\s*=\s*"([0-9a-fA-F]+)"/
+  : /\[\[kv_namespaces\]\][\s\S]*?id\s*=\s*"([0-9a-fA-F]+)"/
+const kvTitle = targetEnv ? 'ctxlayer-dev-oauth' : KV_NAME
+const kvMatch = toml.match(kvPattern)
 if (!kvMatch) {
-  console.error('Could not find kv_namespaces.id in wrangler.toml')
+  console.error(`Could not find ${targetEnv ? 'env.dev ' : ''}kv_namespaces.id in wrangler.toml`)
   process.exit(1)
 }
 const currentKvId = kvMatch[1]
 if (PLACEHOLDER_RE.test(currentKvId)) {
-  console.log(`\nProvisioning KV namespace "${KV_NAME}"…`)
-  const out = run(['kv', 'namespace', 'create', KV_NAME])
+  console.log(`\nProvisioning KV namespace "${kvTitle}"…`)
+  const out = run(['kv', 'namespace', 'create', kvTitle])
   // Output looks like: id = "abc123..."
   const idMatch = out.match(/id\s*=\s*"([0-9a-fA-F]+)"/)
   if (!idMatch) {
     console.error('Could not parse KV id from wrangler output:\n' + out)
     process.exit(1)
   }
-  patch(/(\[\[kv_namespaces\]\][\s\S]*?id\s*=\s*)"[^"]*"/, `$1"${idMatch[1]}"`, 'KV namespace id')
+  const kvPatch = targetEnv
+    ? /(\[\[env\.dev\.kv_namespaces\]\][\s\S]*?id\s*=\s*)"[^"]*"/
+    : /(\[\[kv_namespaces\]\][\s\S]*?id\s*=\s*)"[^"]*"/
+  patch(kvPatch, `$1"${idMatch[1]}"`, 'KV namespace id')
   console.log(`✓ KV id: ${idMatch[1]}`)
 } else {
   console.log(`✓ KV already provisioned (id: ${currentKvId})`)

@@ -12,21 +12,18 @@
 import { Hono } from 'hono'
 import { PasteBearerRequest } from '@ctxlayer/shared'
 import type { Env } from '../env'
-import { requireUser, type AuthedVariables } from '../auth/middleware'
+import { requireUser, skipGatewayOauthCallback, type AuthedVariables } from '../auth/middleware'
 import { requireCsrf } from '../auth/csrf'
 import { seal } from '../crypto/aead'
 import { auditFromCtx } from '../audit/log'
 import { getUpstreamVisibleToUser, listUserUpstreamSummaries } from '../db/queries/upstreams'
-import {
-  deleteUserCredential,
-  upsertUserCredential
-} from '../db/queries/upstream-credentials'
+import { deleteUserCredential, upsertUserCredential } from '../db/queries/upstream-credentials'
 import { refreshCatalogueByUpstreamId } from '../upstream/catalogue'
 import { buildUpstreamToolsPayload } from './upstreams-attachments'
 import { notFound, parseJsonBody } from './respond'
 
 export const upstreamsRoute = new Hono<{ Bindings: Env; Variables: AuthedVariables }>()
-upstreamsRoute.use('*', requireUser)
+upstreamsRoute.use('*', skipGatewayOauthCallback(requireUser))
 
 upstreamsRoute.get('/', async (c) => {
   const userId = c.get('user').userId

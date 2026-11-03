@@ -9,7 +9,11 @@ import {
 } from './session'
 import { csrfSetCookie, newCsrfToken } from './csrf'
 import { accessTrustConfigured, verifyCfAccessJwt } from './cf-access'
+import { consumeGatewayJti, decideGateway, safeRid } from './kedi-gateway'
+import { resolveGatewayUser } from '../db/queries/external-identities'
+import { runWithGatewayTenant } from '../db/tenant-db'
 import { EmailOnOtherIdpError, findById, upsertUser, type UserRow } from '../db/queries/users'
+import { errMessage } from '../util/errors'
 import type { Role } from '@ctxlayer/shared'
 
 export interface SessionUser {
@@ -40,8 +44,23 @@ type Ctx = AuthedContext
  */
 async function resolveActiveUser(
   c: Ctx
+): Promise<{ user: SessionUser; row: UserRow; tenantId?: string } | { error: Response }> {
+  // 0. Trusted gateway bearer. Only when KEDI_GATEWAY_* is configured AND
+  //    the request presents Authorization: Bearer. No cookie is minted.
+  //    A presented bearer that fails does not fall through to the cookie.
+  const gateway = await resolveFromGateway(c)
+  if (gateway) return gateway
+  return resolveBrowserUser(c)
+}
+
+/**
+ * Cookie session, then Cloudflare Access. No gateway bearer. OAuth callbacks
+ * use this for the cookie dance so an IdP redirect is not treated as a
+ * gateway call and a bad assertion cannot satisfy the callback.
+ */
+export async function resolveBrowserUser(
+  c: Ctx
 ): Promise<{ user: SessionUser; row: UserRow } | { error: Response }> {
-  // 1. An existing session cookie wins — the cheap path, no Access/IdP work.
   const cookie = readSessionCookie(c.req.raw)
   const payload = await verifySession(cookie, c.env.SESSION_COOKIE_SECRET)
   if (payload) {
@@ -58,15 +77,72 @@ async function resolveActiveUser(
     return { user: { userId: row.id, role: row.role }, row }
   }
 
-  // 2. No session yet — when deployed behind Cloudflare Access, mint one from
-  //    the edge-asserted identity. Only the first request of a session reaches
-  //    here; the cookie set below short-circuits every request after it.
+  // No session yet — when deployed behind Cloudflare Access, mint one from
+  // the edge-asserted identity. Only the first request of a session reaches
+  // here; the cookie set below short-circuits every request after it.
   if (accessTrustConfigured(c.env)) {
     const established = await establishFromAccess(c)
     if (established) return established
   }
 
   return { error: c.json({ error: 'not_signed_in' }, 401) }
+}
+
+/**
+ * Nest called `/api/*` on behalf of a user. Identity comes from the
+ * assertion, not from a browser cookie. `null` means this request is not
+ * a gateway call (mode off, or no bearer) and the cookie path should run.
+ */
+async function resolveFromGateway(
+  c: Ctx
+): Promise<{ user: SessionUser; row: UserRow; tenantId: string } | { error: Response } | null> {
+  const decision = await decideGateway(c.req.raw, c.env)
+  if (decision.kind === 'skip') return null
+  if (decision.kind === 'reject') {
+    console.warn(`[kedi-gateway] reject reason=${decision.reason}`)
+    return { error: c.json({ error: 'not_signed_in' }, 401) }
+  }
+
+  let resolved: Awaited<ReturnType<typeof resolveGatewayUser>>
+  try {
+    resolved = await resolveGatewayUser(c.env, {
+      issuer: decision.claims.iss,
+      subject: decision.claims.sub,
+      tenantId: decision.claims.tid,
+      hubRole: decision.claims.hubRole,
+      name: decision.claims.name,
+      email: decision.claims.email
+    })
+  } catch (err) {
+    console.error(`[kedi-gateway] identity failed: ${errMessage(err)}`)
+    return { error: c.json({ error: 'not_signed_in' }, 401) }
+  }
+  if ('inactive' in resolved) {
+    console.warn(`[kedi-gateway] reject reason=inactive rid=${safeRid(decision.claims.rid)}`)
+    return { error: c.json({ error: 'not_signed_in' }, 401) }
+  }
+
+  const consumed = await consumeGatewayJti(c.env, decision.claims, undefined, c.req.raw)
+  if (consumed !== 'ok') {
+    console.warn(`[kedi-gateway] reject reason=${consumed} rid=${safeRid(decision.claims.rid)}`)
+    return { error: c.json({ error: 'not_signed_in' }, 401) }
+  }
+  const row = resolved.user
+  return { user: { userId: row.id, role: row.role }, row, tenantId: decision.claims.tid }
+}
+
+function continueAuthed(
+  c: Ctx,
+  resolved: { user: SessionUser; row: UserRow; tenantId?: string },
+  next: () => Promise<void>
+): Promise<void> {
+  c.set('user', resolved.user)
+  c.set('userRow', resolved.row)
+  // Scope only the gateway request. Cookie and Access sessions stay on the
+  // unpartitioned deployment org, which is every row that existed before
+  // tenant_id was added.
+  if (resolved.tenantId) return runWithGatewayTenant(resolved.tenantId, () => next())
+  return next()
 }
 
 /**
@@ -137,15 +213,42 @@ async function establishFromAccess(
  *   route.use('*', requireUser)
  *   route.get('/', (c) => c.json({ userId: c.get('user').userId }))
  */
+function alreadyAuthed(c: Ctx): { user: SessionUser; row: UserRow } | null {
+  const user = c.get('user') as SessionUser | undefined
+  const row = c.get('userRow') as UserRow | undefined
+  if (!user?.userId || !row?.id) return null
+  return { user, row }
+}
+
+const OAUTH_CALLBACK_PATHS = new Set([
+  '/api/upstreams/oauth/callback',
+  '/api/git-sources/oauth/callback'
+])
+
+/**
+ * IdP redirects land on these GETs with no ctxlayer cookie and no bearer.
+ * Parent routers mounted on the same prefix must not run requireUser there;
+ * the callback identifies the user from the one-time KV state.
+ */
+export function skipGatewayOauthCallback<E extends { Bindings: Env; Variables: AuthedVariables }>(
+  mw: MiddlewareHandler<E>
+): MiddlewareHandler<E> {
+  return async (c, next) => {
+    if (OAUTH_CALLBACK_PATHS.has(c.req.path)) return next()
+    return mw(c, next)
+  }
+}
+
 export const requireUser: MiddlewareHandler<{
   Bindings: Env
   Variables: AuthedVariables
 }> = async (c, next) => {
+  // A second router on the same prefix (docs + editors/tags/git, upstreams
+  // + oauth start) would otherwise verify the assertion again and burn jti.
+  if (alreadyAuthed(c)) return next()
   const resolved = await resolveActiveUser(c)
   if ('error' in resolved) return resolved.error
-  c.set('user', resolved.user)
-  c.set('userRow', resolved.row)
-  await next()
+  return continueAuthed(c, resolved, next)
 }
 
 /** Same as requireUser, but additionally requires role==='admin'. */
@@ -153,10 +256,13 @@ export const requireAdmin: MiddlewareHandler<{
   Bindings: Env
   Variables: AuthedVariables
 }> = async (c, next) => {
+  const existing = alreadyAuthed(c)
+  if (existing) {
+    if (existing.user.role !== 'admin') return c.json({ error: 'forbidden' }, 403)
+    return next()
+  }
   const resolved = await resolveActiveUser(c)
   if ('error' in resolved) return resolved.error
   if (resolved.user.role !== 'admin') return c.json({ error: 'forbidden' }, 403)
-  c.set('user', resolved.user)
-  c.set('userRow', resolved.row)
-  await next()
+  return continueAuthed(c, resolved, next)
 }

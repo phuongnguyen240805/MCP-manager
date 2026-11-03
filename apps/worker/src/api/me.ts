@@ -19,7 +19,7 @@ meRoute.get('/', async (c) => {
 
   const body: MeResponse = {
     id: row.id,
-    email: row.email,
+    email: row.idp === 'kedi' && row.display_email ? row.display_email : row.email,
     name: row.name,
     avatarUrl: row.avatar_url,
     role: row.role as Role,

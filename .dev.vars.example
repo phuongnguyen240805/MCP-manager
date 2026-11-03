@@ -48,3 +48,16 @@ CI_SMOKE_OAUTH_CLIENT_SECRET=
 # Observability (optional; leave blank to disable). Slack/Discord/generic
 # incoming webhook — cron/queue/poison failures are POSTed here.
 ALERT_WEBHOOK_URL=
+
+# Trusted gateway (Kedi Nest → /api). All four must be set or the mode stays
+# off. Placeholders only — replace PUBLIC_JWK with the public half from
+# `bun scripts/kedi-gateway-assertion.mjs`. Do not put a private key here.
+KEDI_GATEWAY_ISSUER=https://kedi-gateway.example
+KEDI_GATEWAY_AUDIENCE=ctxlayer
+KEDI_GATEWAY_PUBLIC_JWK={"kty":"EC","crv":"P-256","kid":"placeholder","alg":"ES256","x":"placeholder","y":"placeholder"}
+KEDI_GATEWAY_ALLOWED_TENANTS=tenant_placeholder
+# Optional. Exact browser origins (no path), comma-separated.
+# ALLOWED_ORIGINS: /collab WebSocket tickets. RETURN_ORIGINS: OAuth
+# start ?return_origin= and the callback bounce. Unset ⇒ those hops stay off.
+KEDI_GATEWAY_ALLOWED_ORIGINS=https://kedi.example
+KEDI_GATEWAY_RETURN_ORIGINS=https://kedi.example

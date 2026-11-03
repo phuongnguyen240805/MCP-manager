@@ -57,6 +57,21 @@ export interface Env {
   // When set, `ops/alert.ts notify()` POSTs cron/queue/poison failures here so
   // they're not buried in pull-only logs. Unset ⇒ alerting is a no-op.
   ALERT_WEBHOOK_URL?: string
+  // Trusted gateway (Kedi Nest). All four must be non-empty or the bearer
+  // path stays off and only the cookie/IdP session runs. PUBLIC_JWK is a
+  // wrangler secret: one JWK or a JWKS `{ keys: [...] }` for rotation.
+  // ALLOWED_TENANTS is comma-separated Nest tenant ids (`tid`).
+  KEDI_GATEWAY_ISSUER?: string
+  KEDI_GATEWAY_AUDIENCE?: string
+  KEDI_GATEWAY_PUBLIC_JWK?: string
+  KEDI_GATEWAY_ALLOWED_TENANTS?: string
+  // Exact browser origins (`scheme://host[:port]`, comma-separated) that may
+  // open `/collab/:id` with a one-time gateway ticket. Unset ⇒ cookie origin
+  // rules only. Does not turn the bearer path on or off.
+  KEDI_GATEWAY_ALLOWED_ORIGINS?: string
+  // Origins a gateway OAuth `start` may send the browser back to, combined
+  // with the existing `return_to` path. Unset ⇒ gateway start rejects.
+  KEDI_GATEWAY_RETURN_ORIGINS?: string
 
   // Resource bindings
   DB: D1Database

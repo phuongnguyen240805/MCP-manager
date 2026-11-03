@@ -6,6 +6,7 @@
  *
  *   bun scripts/deploy.mjs                         # wrangler deploy (base wrangler.toml)
  *   bun scripts/deploy.mjs --preview               # wrangler versions upload
+ *   bun scripts/deploy.mjs --env dev               # the ctxlayer-dev worker ([env.dev])
  *   bun scripts/deploy.mjs --config wrangler.dev.toml
  *                                                  # per-host deploy (multi-tenant; pass
  *                                                  #   PUBLIC_BASE_URL=https://<host> in the env)
@@ -24,6 +25,13 @@ const preview = process.argv.includes('--preview')
 // `-c <path>` so the same GIT_SHA/BUILT_AT stamping covers every tenant.
 const configIdx = process.argv.indexOf('--config')
 const configPath = configIdx !== -1 ? process.argv[configIdx + 1] : null
+// Named wrangler environment (`--env dev` deploys the ctxlayer-dev worker).
+const envIdx = process.argv.indexOf('--env')
+const envName = envIdx !== -1 ? process.argv[envIdx + 1] : null
+if (envIdx !== -1 && !envName) {
+  console.error('[deploy] --env requires a name (for example: --env dev)')
+  process.exit(1)
+}
 
 // Parse a `.prod.vars` (KEY=VALUE lines, `#` comments). Returns {} if absent.
 function loadProdVars() {
@@ -79,9 +87,10 @@ if (!configPath && githubUsers) vars.push(['ALLOWED_GITHUB_USERS', githubUsers])
 if (!configPath && accessPolicy) vars.push(['ACCESS_POLICY', accessPolicy])
 const varArgs = vars.flatMap(([k, v]) => ['--var', `${k}:${v}`])
 const configArgs = configPath ? ['-c', configPath] : []
+const envArgs = envName ? ['--env', envName] : []
 const wranglerArgs = preview
-  ? ['versions', 'upload', ...configArgs, ...varArgs]
-  : ['deploy', ...configArgs, ...varArgs]
+  ? ['versions', 'upload', ...configArgs, ...envArgs, ...varArgs]
+  : ['deploy', ...configArgs, ...envArgs, ...varArgs]
 
 // HSTS for the static-asset responses (the SPA shell + /assets/*, which
 // bypass the worker). We inject it here — at deploy/preview time — rather

@@ -37,6 +37,11 @@ export interface UserRow {
   last_seen_at: number | null
   /** A7: cookies minted under an older epoch are rejected per request. */
   session_epoch: number
+  /**
+   * Gateway display address from `external_identities`. Not selected by
+   * cookie lookups. Never written to `users.email` and never used to join.
+   */
+  display_email?: string | null
 }
 
 export interface UpsertUserInput {
@@ -177,7 +182,7 @@ export async function listUserRefs(
  * separate aggregate query — small enough to be a second roundtrip.
  */
 export async function listAdminUserRows(env: Env): Promise<AdminUserRow[]> {
-  const [usersRes, teamsRes, rolesRes, credsRes] = await Promise.all([
+  const [usersRes, teamsRes, rolesRes, credsRes, displayRes] = await Promise.all([
     env.DB.prepare(
       `SELECT id, email, name, avatar_url, idp, role, status, created_at, last_seen_at
        FROM users ORDER BY LOWER(email)`
@@ -221,7 +226,10 @@ export async function listAdminUserRows(env: Env): Promise<AdminUserRow[]> {
     env.DB.prepare(`SELECT user_id, COUNT(*) AS n FROM user_credentials GROUP BY user_id`).all<{
       user_id: string
       n: number
-    }>()
+    }>(),
+    env.DB.prepare(
+      `SELECT user_id, display_email FROM external_identities WHERE display_email IS NOT NULL`
+    ).all<{ user_id: string; display_email: string }>()
   ])
 
   const teamsByUser = new Map<string, AdminUserTeam[]>()
@@ -249,10 +257,16 @@ export async function listAdminUserRows(env: Env): Promise<AdminUserRow[]> {
   }
   const credsByUser = new Map<string, number>()
   for (const r of credsRes.results ?? []) credsByUser.set(r.user_id, r.n)
+  const displayByUser = new Map<string, string>()
+  for (const r of displayRes.results ?? []) {
+    if (r.display_email) displayByUser.set(r.user_id, r.display_email)
+  }
 
   return (usersRes.results ?? []).map((u) => ({
     id: u.id,
-    email: u.email,
+    // Kedi members show the assertion address. users.email stays synthetic
+    // so an invite or another IdP cannot attach to this row.
+    email: displayByUser.get(u.id) ?? u.email,
     name: u.name,
     avatarUrl: u.avatar_url,
     role: u.role,
@@ -329,9 +343,7 @@ export async function deleteUser(
   userId: string,
   actorId: string
 ): Promise<{ reassignedSkills: number }> {
-  const skillCount = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM skills WHERE created_by = ?1`
-  )
+  const skillCount = await env.DB.prepare(`SELECT COUNT(*) AS n FROM skills WHERE created_by = ?1`)
     .bind(userId)
     .first<{ n: number }>()
 
@@ -363,7 +375,6 @@ function parseAdminEmails(raw: string | undefined): Set<string> {
       .filter(Boolean)
   )
 }
-
 
 /**
  * Case-insensitive email-prefix lookup for the Sharing dialog autocomplete

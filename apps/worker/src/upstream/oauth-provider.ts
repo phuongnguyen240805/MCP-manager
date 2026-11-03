@@ -48,6 +48,7 @@ import {
   upsertUserCredential
 } from '../db/queries/upstream-credentials'
 import type { UpstreamAuthConfig } from '@ctxlayer/shared'
+import type { GatewayOAuthBind } from '../auth/kedi-gateway'
 
 const VERIFIER_TTL_SECONDS = 600
 const REDIRECT_PATH = '/api/upstreams/oauth/callback'
@@ -65,6 +66,9 @@ interface StoredVerifier {
   /** Defaults to 'user' (i.e. /upstreams) when absent for older rows. */
   returnTo?: OAuthReturnTarget
   createdAt: number
+  /** Set only for a gateway start. The callback has no session cookie. */
+  tenantId?: string
+  returnOrigin?: string
 }
 
 interface OAuthAuthConfig {
@@ -109,7 +113,8 @@ export class UpstreamOAuthProvider implements OAuthClientProvider {
      * send the user back. Only consulted on the start path; the callback
      * reads its own copy via `readVerifierState`.
      */
-    private readonly returnTo?: OAuthReturnTarget
+    private readonly returnTo?: OAuthReturnTarget,
+    private readonly gateway?: GatewayOAuthBind
   ) {
     if (presetState) {
       this.stateToken = presetState
@@ -170,7 +175,9 @@ export class UpstreamOAuthProvider implements OAuthClientProvider {
       userId: this.userId,
       upstreamId: this.upstream.id,
       returnTo: this.returnTo,
-      createdAt: Math.floor(Date.now() / 1000)
+      createdAt: Math.floor(Date.now() / 1000),
+      tenantId: this.gateway?.tenantId,
+      returnOrigin: this.gateway?.returnOrigin
     }
     await this.env.OAUTH_KV.put(verifierKey(state), JSON.stringify(stored), {
       expirationTtl: VERIFIER_TTL_SECONDS

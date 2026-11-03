@@ -72,8 +72,10 @@ export interface InsertJobInput {
  */
 export async function insertRunningJob(env: Env, j: InsertJobInput): Promise<void> {
   await env.DB.prepare(
-    `INSERT INTO async_jobs (id, user_id, session_id, upstream_id, tool, job_key, status, created_at, args_json)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)`
+    `INSERT INTO async_jobs
+       (id, user_id, session_id, upstream_id, tool, job_key, status, created_at, args_json, tenant_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8,
+             (SELECT tenant_id FROM users WHERE id = ?2))`
   )
     .bind(
       j.id,

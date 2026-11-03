@@ -16,7 +16,7 @@ import {
   type GitDocStatus
 } from '@ctxlayer/shared'
 import type { Env } from '../env'
-import { requireUser, type AuthedVariables } from '../auth/middleware'
+import { requireUser, skipGatewayOauthCallback, type AuthedVariables } from '../auth/middleware'
 import { requireCsrf } from '../auth/csrf'
 import { auditFromCtx } from '../audit/log'
 import { canEditDoc, getDocById } from '../db/queries/docs'
@@ -111,7 +111,9 @@ gitDocsRoute.get('/:id/git', async (c) => {
   // Block write-back when the source carries HTML the editor can't round-trip
   // (it's dropped on parse, so a PR would commit it away). Read source.md only
   // when the user could otherwise write — viewers don't need the flag.
-  const htmlUnsafe = canWrite ? htmlRoundtripUnsafe((await readSourceMarkdown(c.env, id)) ?? '') : false
+  const htmlUnsafe = canWrite
+    ? htmlRoundtripUnsafe((await readSourceMarkdown(c.env, id)) ?? '')
+    : false
   const body: GitDocStatus = {
     gitSourceId: source.id,
     sourceSlug: source.slug,
@@ -232,7 +234,7 @@ gitDocsRoute.post('/:id/git/review-url', async (c) => {
 // ----- per-user credentials (/api/git-sources) ---------------------------
 
 export const gitSourcesUserRoute = new Hono<{ Bindings: Env; Variables: AuthedVariables }>()
-gitSourcesUserRoute.use('*', requireUser)
+gitSourcesUserRoute.use('*', skipGatewayOauthCallback(requireUser))
 gitSourcesUserRoute.use('*', requireCsrf)
 
 gitSourcesUserRoute.put('/:id/credentials', async (c) => {

@@ -198,6 +198,8 @@ docsRoute.get('/:id/revisions', async (c) => {
 docsRoute.get('/:id/revisions/:rev/content', async (c) => {
   const id = c.req.param('id')
   const rev = c.req.param('rev')
+  // Parent first: revision rows are not partitioned, the document is.
+  if (!(await getDocById(c.env, id))) return notFound(c)
   if (!(await getRevision(c.env, id, rev))) return notFound(c)
   const content = await readRevision(c.env, id, rev)
   if (!content) return notFound(c)

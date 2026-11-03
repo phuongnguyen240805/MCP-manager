@@ -18,6 +18,7 @@ import type { Env } from '../env'
 import { readCookie } from './session'
 import { isAllowedOrigin } from '../util/origin'
 import { randomToken } from '../util/base64url'
+import { decideGateway } from './kedi-gateway'
 
 const CSRF_COOKIE_NAME = '__Host-ctx_csrf'
 const CSRF_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
@@ -65,6 +66,17 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
  */
 export const requireCsrf: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
   if (SAFE_METHODS.has(c.req.method)) {
+    await next()
+    return
+  }
+  // A verified gateway assertion is a bearer the browser will not attach
+  // on its own. Skip the cookie double-submit only after the signature,
+  // issuer, audience, lifetime, and tenant checks succeed. Replay is
+  // enforced in requireUser (the jti is consumed there); checking it
+  // again here would reject the request we just authorized. A bearer
+  // that does not verify falls through to the cookie CSRF rules.
+  const gateway = await decideGateway(c.req.raw, c.env)
+  if (gateway.kind === 'ok') {
     await next()
     return
   }

@@ -72,6 +72,17 @@ adminUsersRoute.patch('/:id', requireCsrf, async (c) => {
     // No-op; treat as success so the SPA can be idempotent.
     return new Response(null, { status: 204 })
   }
+  // Gateway role follows hub_role on the next assertion. A local PATCH
+  // would be overwritten, and an email invite does not admit this user.
+  if (target.idp === 'kedi') {
+    return c.json(
+      {
+        error: 'kedi_role_locked',
+        hint: 'Kedi manages this role. Email invites do not admit gateway users.'
+      },
+      409
+    )
+  }
 
   // Guard: refuse to demote the last *active* admin. Without this any
   // single-admin org could click itself out of admin access and never
@@ -246,13 +257,13 @@ async function guardRemovesAdminAccess(
   verb: 'suspend' | 'delete'
 ): Promise<Response | null> {
   if (target.id === actorId) {
-    return c.json({ error: `cannot_${verb}_self`, hint: `You can't ${verb} your own account.` }, 400)
-  }
-  if (target.role === 'admin' && (await countActiveAdmins(c.env, target.id)) < 1) {
     return c.json(
-      { error: 'last_admin', hint: 'Promote another active admin first.' },
+      { error: `cannot_${verb}_self`, hint: `You can't ${verb} your own account.` },
       400
     )
+  }
+  if (target.role === 'admin' && (await countActiveAdmins(c.env, target.id)) < 1) {
+    return c.json({ error: 'last_admin', hint: 'Promote another active admin first.' }, 400)
   }
   return null
 }

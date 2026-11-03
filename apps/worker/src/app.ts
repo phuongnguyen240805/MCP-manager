@@ -50,8 +50,16 @@ import { googleIdpRoute } from './idp/google'
 import { githubIdpRoute } from './idp/github'
 import { handleAuthorize, handleAuthorizeDecision } from './oauth/authorize-page'
 import { handleCollabUpgrade } from './collab/upgrade'
+import { ensureTenantAwareDb } from './db/tenant-db'
 
 export const app = new Hono<{ Bindings: Env }>()
+
+// Gateway requests partition D1 through this proxy. Cookie / MCP / cron
+// have no tenant scope, so prepare() stays the original statement.
+app.use('*', async (c, next) => {
+  ensureTenantAwareDb(c.env)
+  await next()
+})
 
 app.route('/api/health', healthRoute)
 app.route('/api/version', versionRoute)

@@ -108,8 +108,11 @@ export async function findUnredeemedInvite(
   env: Env,
   email: string
 ): Promise<{ id: string } | null> {
+  // Cookie admission only. A gateway invite is stamped with tenant_id and
+  // must not admit that address into the deployment org.
   const row = await env.DB.prepare(
-    `SELECT id FROM invites WHERE LOWER(email) = LOWER(?1) AND redeemed_at IS NULL`
+    `SELECT id FROM invites
+     WHERE LOWER(email) = LOWER(?1) AND redeemed_at IS NULL AND tenant_id IS NULL`
   )
     .bind(email)
     .first<{ id: string }>()
