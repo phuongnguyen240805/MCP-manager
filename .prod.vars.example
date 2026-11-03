@@ -37,3 +37,7 @@ PUBLIC_BASE_URL=https://your-worker.workers.dev
 # KEDI_GATEWAY_AUDIENCE=ctxlayer
 # KEDI_GATEWAY_PUBLIC_JWK={"kty":"EC","crv":"P-256","kid":"placeholder","alg":"ES256","x":"placeholder","y":"placeholder"}
 # KEDI_GATEWAY_ALLOWED_TENANTS=tenant_placeholder
+# Optional browser origins for collab tickets and OAuth return pages.
+# Comma-separated exact origins, no path. `wrangler secret put` each one.
+# KEDI_GATEWAY_ALLOWED_ORIGINS=https://kedi.example
+# KEDI_GATEWAY_RETURN_ORIGINS=https://kedi.example

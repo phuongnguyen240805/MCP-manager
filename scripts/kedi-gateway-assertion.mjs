@@ -39,6 +39,8 @@ const sub = arg('sub', 'user_dev')
 const tid = arg('tid', 'tenant_placeholder')
 const role = arg('role', 'member')
 const oid = arg('oid', '')
+const name = arg('name', '')
+const email = arg('email', '')
 const ttlRaw = Number(arg('ttl', '60'))
 const rotate = process.argv.includes('--rotate')
 
@@ -116,6 +118,8 @@ const payload = {
   exp: now + ttlRaw
 }
 if (oid) payload.oid = oid
+if (name) payload.name = name
+if (email) payload.email = email
 
 const header = { alg: 'ES256', typ: 'JWT', kid }
 const h = b64url(new TextEncoder().encode(JSON.stringify(header)))

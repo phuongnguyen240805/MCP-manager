@@ -65,6 +65,13 @@ export interface Env {
   KEDI_GATEWAY_AUDIENCE?: string
   KEDI_GATEWAY_PUBLIC_JWK?: string
   KEDI_GATEWAY_ALLOWED_TENANTS?: string
+  // Exact browser origins (`scheme://host[:port]`, comma-separated) that may
+  // open `/collab/:id` with a one-time gateway ticket. Unset ⇒ cookie origin
+  // rules only. Does not turn the bearer path on or off.
+  KEDI_GATEWAY_ALLOWED_ORIGINS?: string
+  // Origins a gateway OAuth `start` may send the browser back to, combined
+  // with the existing `return_to` path. Unset ⇒ gateway start rejects.
+  KEDI_GATEWAY_RETURN_ORIGINS?: string
 
   // Resource bindings
   DB: D1Database

@@ -10,23 +10,29 @@
  *   already valid) we just redirect back to `/upstreams` — no flow
  *   needed.
  *
- * - `GET /api/upstreams/oauth/callback?code=&state=` — required-user.
- *   Reads `{verifier, userId, upstreamId}` from `OAUTH_KV` using the
- *   `state` query param, verifies the caller matches the original
- *   user (anti-pivot defence), loads the upstream, builds a provider
- *   bound to that state, and calls `auth(provider, {serverUrl,
- *   authorizationCode})`. SDK exchanges the code → tokens → calls
- *   `provider.saveTokens()` which seals them into `user_credentials`.
+ * - `GET /api/upstreams/oauth/callback?code=&state=` — no session
+ *   middleware. The one-time KV state names the user. A cookie start
+ *   still requires that browser session to match. A gateway start
+ *   stores `tenantId` + an allowlisted `returnOrigin` and the callback
+ *   runs in that tenant (the IdP redirect has no ctxlayer cookie).
  *
  * The callback path is GLOBAL (not per-upstream) so we only need one
- * redirect_uri registered per ctxlayer deployment.
+ * redirect_uri registered per ctxlayer deployment. That redirect_uri
+ * stays this Worker's `/api/upstreams/oauth/callback`. It is not a
+ * Nest URL: the IdP sends the browser here, and we bounce to Kedi.
  */
 
 import { Hono, type Context } from 'hono'
 import { auth as mcpAuth } from '@modelcontextprotocol/sdk/client/auth.js'
 import { OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import type { Env } from '../env'
-import { requireUser, type AuthedVariables } from '../auth/middleware'
+import { decideGateway, type GatewayOAuthBind } from '../auth/kedi-gateway'
+import {
+  requireUser,
+  resolveBrowserUser,
+  skipGatewayOauthCallback,
+  type AuthedVariables
+} from '../auth/middleware'
 import {
   getUpstreamVisibleToUser,
   parseAuthConfig,
@@ -49,6 +55,8 @@ import { refreshCatalogueByUpstreamId, warmCatalogueAndLog } from '../upstream/c
 import { notFound } from './respond'
 import { errMessage } from '../util/errors'
 import { newCorrelationId } from '../mcp/upstream-error'
+import { gatewayReturnOrigin, listedOrigin } from '../util/origin'
+import { isGatewayTenantId, runWithGatewayTenant } from '../db/tenant-db'
 
 // SPA paths we're allowed to bounce the user back to after the OAuth
 // dance — `return_to=admin` lands them on the admin upstreams page
@@ -62,25 +70,40 @@ function parseReturnTo(raw: string | undefined): OAuthReturnTarget {
   return raw === 'admin' ? 'admin' : 'user'
 }
 
-function spaReturnUrl(env: Env, target: OAuthReturnTarget): string {
-  return new URL(RETURN_PATHS[target], env.PUBLIC_BASE_URL).toString()
+function spaReturnUrl(env: Env, target: OAuthReturnTarget, returnOrigin?: string): string {
+  return new URL(RETURN_PATHS[target], returnOrigin ?? env.PUBLIC_BASE_URL).toString()
+}
+
+function authorizeBody(url: string): Response {
+  return Response.json({ authorizeUrl: url })
 }
 
 export const upstreamOauthStartRoute = new Hono<{
   Bindings: Env
   Variables: AuthedVariables
 }>()
-upstreamOauthStartRoute.use('*', requireUser)
+upstreamOauthStartRoute.use('*', skipGatewayOauthCallback(requireUser))
 
 upstreamOauthStartRoute.get('/:id/oauth/start', async (c) => {
+  const gateway = await decideGateway(c.req.raw, c.env)
   // Two inner branches below delete stored credentials, and SameSite=Lax does
   // not stop a forced TOP-LEVEL cross-site navigation to a GET. Legit entries
   // are the SPA (same-origin navigation) or a hand-typed URL (none); reject
   // what the browser itself labels cross-site. An absent header (older
   // browsers, curl) passes — defense-in-depth on top of requireUser.
-  const fetchSite = c.req.header('sec-fetch-site')
-  if (fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') {
-    return c.json({ error: 'cross_site_navigation' }, 403)
+  // A verified gateway call is server-side or cross-site from Kedi; the
+  // assertion is the credential, so Sec-Fetch-Site is not a signal here.
+  if (gateway.kind !== 'ok') {
+    const fetchSite = c.req.header('sec-fetch-site')
+    if (fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') {
+      return c.json({ error: 'cross_site_navigation' }, 403)
+    }
+  }
+  let bind: GatewayOAuthBind | undefined
+  if (gateway.kind === 'ok') {
+    const returnOrigin = gatewayReturnOrigin(c.req.raw, c.env.KEDI_GATEWAY_RETURN_ORIGINS)
+    if (!returnOrigin) return c.json({ error: 'return_origin_rejected' }, 400)
+    bind = { tenantId: gateway.claims.tid, returnOrigin }
   }
   const userId = c.get('user').userId
   const id = c.req.param('id')
@@ -99,7 +122,7 @@ upstreamOauthStartRoute.get('/:id/oauth/start', async (c) => {
   const renew = c.req.query('renew') === '1'
 
   try {
-    return await runStart(c, upstream, userId, returnTo, true, renew)
+    return await runStart(c, upstream, userId, returnTo, true, renew, bind)
   } catch (err) {
     // OAuth error during the refresh attempt — most commonly Notion (or
     // any upstream) rotating / revoking / expiring our stored
@@ -113,7 +136,7 @@ upstreamOauthStartRoute.get('/:id/oauth/start', async (c) => {
       )
       await deleteUserCredential(c.env, userId, upstream.id)
       try {
-        return await runStart(c, upstream, userId, returnTo)
+        return await runStart(c, upstream, userId, returnTo, true, false, bind)
       } catch (retryErr) {
         return oauthStartFailed(c, upstream.slug, retryErr, 'retry after wipe failed')
       }
@@ -150,9 +173,10 @@ async function runStart(
   selfHeal = true,
   // Skip the refresh-first shortcut and go straight to the provider's
   // authorize page (renewing a still-healthy grant).
-  renew = false
+  renew = false,
+  bind?: GatewayOAuthBind
 ) {
-  const provider = new UpstreamOAuthProvider(c.env, upstream, userId, undefined, returnTo)
+  const provider = new UpstreamOAuthProvider(c.env, upstream, userId, undefined, returnTo, bind)
   provider.forceInteractive = renew
 
   // Resolve a usable access token (`access`) via one of two paths, or 302 to
@@ -165,7 +189,8 @@ async function runStart(
     // authorize endpoint.
     access = renew ? null : await refreshStatic(c.env, provider, staticCfg)
     if (!access) {
-      return c.redirect(await buildAuthorizeRedirect(provider, staticCfg), 302)
+      const url = await buildAuthorizeRedirect(provider, staticCfg)
+      return bind ? authorizeBody(url) : c.redirect(url, 302)
     }
   } else {
     const result = await mcpAuth(provider, {
@@ -177,7 +202,8 @@ async function runStart(
         // SDK returned 'REDIRECT' but didn't hand us a URL. Defensive: bail.
         return c.json({ error: 'oauth_redirect_missing' }, 500)
       }
-      return c.redirect(provider.capturedRedirect.toString(), 302)
+      const url = provider.capturedRedirect.toString()
+      return bind ? authorizeBody(url) : c.redirect(url, 302)
     }
     access = (await provider.tokens())?.access_token ?? null
   }
@@ -200,7 +226,7 @@ async function runStart(
       `[oauth] ${upstream.slug}: token accepted but rejected at MCP layer (${probe.reason}); wiping creds + forcing interactive re-auth`
     )
     await deleteUserCredential(c.env, userId, upstream.id)
-    return runStart(c, upstream, userId, returnTo, false)
+    return runStart(c, upstream, userId, returnTo, false, false, bind)
   } else {
     console.warn(
       `[catalogue] ${upstream.slug}: reconnect-AUTHORIZED refresh failed (${probe.reason})${
@@ -208,6 +234,7 @@ async function runStart(
       }`
     )
   }
+  if (bind) return c.json({ connected: true })
   return c.redirect(
     `${spaReturnUrl(c.env, returnTo)}?oauth_connected=${encodeURIComponent(upstream.slug)}`,
     302
@@ -218,18 +245,28 @@ export const upstreamOauthCallbackRoute = new Hono<{
   Bindings: Env
   Variables: AuthedVariables
 }>()
-upstreamOauthCallbackRoute.use('*', requireUser)
 
 upstreamOauthCallbackRoute.get('/callback', async (c) => {
-  const userId = c.get('user').userId
   const code = c.req.query('code')
   const state = c.req.query('state')
   const errParam = c.req.query('error')
+  const stored = state ? await readVerifierState(c.env, state) : null
 
   // returnTo isn't known yet if state is missing/expired; default to
   // the user-side page in that degenerate path so we still land
   // somewhere sensible.
-  let returnTo: OAuthReturnTarget = 'user'
+  const returnTo: OAuthReturnTarget = stored?.returnTo ?? 'user'
+  const gatewayFinish = stored?.tenantId
+    ? checkedGatewayBind(c.env, stored.tenantId, stored.returnOrigin)
+    : null
+  if (gatewayFinish instanceof Response) return gatewayFinish
+
+  const identity = gatewayFinish
+    ? { userId: stored!.userId, bind: gatewayFinish }
+    : await browserCallbackUser(c, stored?.userId)
+  if (identity instanceof Response) return identity
+  const userId = identity.userId
+  const returnOrigin = identity.bind?.returnOrigin
 
   if (errParam) {
     // Forward only the enumerable IdP error CODE; the free-text
@@ -237,24 +274,64 @@ upstreamOauthCallbackRoute.get('/callback', async (c) => {
     // in the server log (matching git-oauth's stricter stance).
     const desc = c.req.query('error_description') ?? ''
     if (desc) console.warn(`[oauth] callback error ${errParam}: ${desc}`)
+    if (state) await deleteVerifierState(c.env, state)
     return c.redirect(
-      `${spaReturnUrl(c.env, returnTo)}?oauth_error=${encodeURIComponent(errParam)}`,
+      `${spaReturnUrl(c.env, returnTo, returnOrigin)}?oauth_error=${encodeURIComponent(errParam)}`,
       302
     )
   }
-  if (!code || !state) {
-    return c.json({ error: 'oauth_callback_missing_params' }, 400)
-  }
-
-  const stored = await readVerifierState(c.env, state)
+  if (!code || !state) return c.json({ error: 'oauth_callback_missing_params' }, 400)
   if (!stored) return c.json({ error: 'oauth_state_unknown_or_expired' }, 400)
-  if (stored.userId !== userId) {
-    // Different user finished the dance — refuse to inject tokens
-    // into someone else's account.
+
+  const finish = () =>
+    completeUpstreamCallback(c, {
+      userId,
+      code,
+      state,
+      stored,
+      returnTo,
+      returnOrigin
+    })
+  if (identity.bind) return runWithGatewayTenant(identity.bind.tenantId, finish)
+  return finish()
+})
+
+function checkedGatewayBind(
+  env: Env,
+  tenantId: string,
+  returnOrigin: string | undefined
+): GatewayOAuthBind | Response {
+  if (!isGatewayTenantId(tenantId))
+    return Response.json({ error: 'oauth_state_unknown_or_expired' }, { status: 400 })
+  const origin = listedOrigin(returnOrigin, env.KEDI_GATEWAY_RETURN_ORIGINS)
+  if (!origin) return Response.json({ error: 'return_origin_rejected' }, { status: 400 })
+  return { tenantId, returnOrigin: origin }
+}
+
+async function browserCallbackUser(
+  c: StartCtx,
+  expectedUserId: string | undefined
+): Promise<{ userId: string; bind?: undefined } | Response> {
+  const session = await resolveBrowserUser(c)
+  if ('error' in session) return session.error
+  if (expectedUserId && session.user.userId !== expectedUserId) {
     return c.json({ error: 'oauth_user_mismatch' }, 403)
   }
-  returnTo = stored.returnTo ?? 'user'
+  return { userId: session.user.userId }
+}
 
+async function completeUpstreamCallback(
+  c: StartCtx,
+  input: {
+    userId: string
+    code: string
+    state: string
+    stored: NonNullable<Awaited<ReturnType<typeof readVerifierState>>>
+    returnTo: OAuthReturnTarget
+    returnOrigin?: string
+  }
+): Promise<Response> {
+  const { userId, code, state, stored, returnTo, returnOrigin } = input
   // Re-check visibility at token time, matching the git twin
   // (`api/git-oauth.ts`): a grant revoked mid-dance must not still land
   // a credential.
@@ -265,7 +342,6 @@ upstreamOauthCallbackRoute.get('/callback', async (c) => {
   const staticCfg = staticOAuth(parseAuthConfig(upstream.auth_config))
   try {
     if (staticCfg) {
-      // Pre-registered (Entra) client: plain auth-code exchange, no SDK.
       await exchangeCode(c.env, provider, staticCfg, code)
     } else {
       const result = await mcpAuth(provider, {
@@ -278,13 +354,10 @@ upstreamOauthCallbackRoute.get('/callback', async (c) => {
       }
     }
   } catch (err) {
-    // Generic code + ref in the URL; exception text (SDK internals, endpoint
-    // URLs) stays server-side. The SPA banner renders "OAuth failed:
-    // exchange — ref:XXXX", enough to correlate with the log line.
     const ref = newCorrelationId()
     console.error(`[oauth] [ref=${ref}] callback exchange failed for ${upstream.slug}:`, err)
     return c.redirect(
-      `${spaReturnUrl(c.env, returnTo)}?oauth_error=exchange&desc=${encodeURIComponent(`ref:${ref}`)}`,
+      `${spaReturnUrl(c.env, returnTo, returnOrigin)}?oauth_error=exchange&desc=${encodeURIComponent(`ref:${ref}`)}`,
       302
     )
   } finally {
@@ -293,8 +366,6 @@ upstreamOauthCallbackRoute.get('/callback', async (c) => {
     await deleteVerifierState(c.env, state)
   }
 
-  // Warm the tool catalogue immediately so the SPA reflects connection
-  // success on reload. Best-effort.
   const access = (await provider.tokens())?.access_token ?? null
   c.executionCtx.waitUntil(
     warmCatalogueAndLog(c.env, {
@@ -307,10 +378,10 @@ upstreamOauthCallbackRoute.get('/callback', async (c) => {
   )
 
   return c.redirect(
-    `${spaReturnUrl(c.env, returnTo)}?oauth_connected=${encodeURIComponent(upstream.slug)}`,
+    `${spaReturnUrl(c.env, returnTo, returnOrigin)}?oauth_connected=${encodeURIComponent(upstream.slug)}`,
     302
   )
-})
+}
 
 /**
  * Does an upstream catalogue-refresh error message signal that the token
@@ -322,5 +393,7 @@ upstreamOauthCallbackRoute.get('/callback', async (c) => {
  */
 export function isReauthSignal(msg: string | undefined | null): boolean {
   if (!msg) return false
-  return /(-32002|session expired|re-?authenticate|invalid[_ ]token|unauthorized|\b401\b)/i.test(msg)
+  return /(-32002|session expired|re-?authenticate|invalid[_ ]token|unauthorized|\b401\b)/i.test(
+    msg
+  )
 }

@@ -17,8 +17,16 @@
 import type { Env } from '../env'
 import { b64urlDecode } from '../util/base64url'
 
-/** Nest issues 60s tokens. Anything longer than this is rejected. */
+/** API assertions. Nest mints ~60s tokens; anything longer than this is rejected. */
 export const GATEWAY_MAX_LIFETIME_SECONDS = 120
+/**
+ * Collab tickets. A browser cannot set `Authorization` on `new WebSocket()`,
+ * so the ticket rides the query string or `Sec-WebSocket-Protocol`. It is
+ * shorter than an API assertion because it is handed to the page.
+ */
+export const COLLAB_TICKET_MAX_LIFETIME_SECONDS = 60
+/** Subprotocol Nest offers alongside the raw ticket JWT. Echo this, not the JWT. */
+export const COLLAB_TICKET_PROTOCOL = 'ctxlayer.kedi-ticket'
 /** Small skew so a token minted on a slightly fast clock still verifies. */
 export const GATEWAY_CLOCK_SKEW_SECONDS = 30
 const MAX_CLAIM_CHARS = 256
@@ -29,11 +37,21 @@ export interface GatewayClaims {
   sub: string
   tid: string
   oid: string | null
+  /** Display only. Never a join key. */
+  name: string | null
+  /** Display only. Never a join key. */
+  email: string | null
   hubRole: 'member' | 'admin'
   jti: string
   rid: string
   iat: number
   exp: number
+}
+
+/** Stored on the OAuth verifier row when `start` was a gateway call. */
+export interface GatewayOAuthBind {
+  tenantId: string
+  returnOrigin: string
 }
 
 export interface GatewayConfig {
@@ -116,7 +134,8 @@ type VerifyResult = { ok: true; claims: GatewayClaims } | { ok: false; reason: s
 export async function verifyGatewayAssertion(
   token: string,
   config: GatewayConfig,
-  now: number
+  now: number,
+  maxLifetimeSeconds: number = GATEWAY_MAX_LIFETIME_SECONDS
 ): Promise<VerifyResult> {
   const parts = token.split('.')
   if (parts.length !== 3) return { ok: false, reason: 'malformed' }
@@ -151,7 +170,7 @@ export async function verifyGatewayAssertion(
   }
   if (!valid) return { ok: false, reason: 'bad_signature' }
 
-  return readClaims(payload, config, now)
+  return readClaims(payload, config, now, maxLifetimeSeconds)
 }
 
 /**
@@ -159,17 +178,40 @@ export async function verifyGatewayAssertion(
  * KV's minimum TTL is 60s, which still covers a token of at most 120s.
  * Returns `replay` when this jti was already stored.
  */
+const jtiOnce = new WeakMap<Request, Promise<'ok' | 'replay' | 'replay_store'>>()
+
 export async function consumeGatewayJti(
   env: Env,
   claims: GatewayClaims,
-  now: number = Math.floor(Date.now() / 1000)
+  now: number = Math.floor(Date.now() / 1000),
+  req?: Request
+): Promise<'ok' | 'replay' | 'replay_store'> {
+  // Hono runs every `use('*')` mounted on the same prefix, so requireUser
+  // can see one Request twice. The second call must not look like a replay.
+  if (req) {
+    const cached = jtiOnce.get(req)
+    if (cached) return cached
+    const pending = consumeGatewayJtiStored(env, claims, now)
+    jtiOnce.set(req, pending)
+    return pending
+  }
+  return consumeGatewayJtiStored(env, claims, now)
+}
+
+async function consumeGatewayJtiStored(
+  env: Env,
+  claims: GatewayClaims,
+  now: number
 ): Promise<'ok' | 'replay' | 'replay_store'> {
   const digest = await sha256Hex(`${claims.iss}\n${claims.jti}`)
   const key = `kedi-gw:jti:${digest}`
   try {
     const existing = await env.OAUTH_KV.get(key)
     if (existing !== null) return 'replay'
-    const ttl = Math.max(60, Math.min(600, Math.ceil(claims.exp - now + GATEWAY_CLOCK_SKEW_SECONDS)))
+    const ttl = Math.max(
+      60,
+      Math.min(600, Math.ceil(claims.exp - now + GATEWAY_CLOCK_SKEW_SECONDS))
+    )
     await env.OAUTH_KV.put(key, '1', { expirationTtl: ttl })
     return 'ok'
   } catch (err) {
@@ -184,10 +226,50 @@ export function safeRid(rid: string): string {
   return clean || '-'
 }
 
+const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/
+
+export interface CollabTicket {
+  token: string
+  /** Set when the ticket arrived as a subprotocol. Echo this on the 101, never the JWT. */
+  echoProtocol: string | null
+}
+
+/**
+ * A collab ticket is the same ES256 assertion, carried where a browser can
+ * put it. Query `ticket` or a `Sec-WebSocket-Protocol` entry that is a JWT.
+ * Offer `ctxlayer.kedi-ticket` as well so the 101 can echo that name.
+ * A present-but-malformed ticket does not fall through to the cookie.
+ */
+export function readCollabTicket(req: Request): {
+  attempted: boolean
+  ticket: CollabTicket | null
+} {
+  const query = new URL(req.url).searchParams.get('ticket')
+  const protocols = (req.headers.get('sec-websocket-protocol') ?? '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
+  const fromProtocol = protocols.find((part) => JWT_RE.test(part)) ?? null
+  const attempted = query !== null || fromProtocol !== null
+  if (!attempted) return { attempted: false, ticket: null }
+  const queryOk = query !== null && JWT_RE.test(query)
+  if (query !== null && !queryOk) return { attempted: true, ticket: null }
+  if (queryOk && fromProtocol && query !== fromProtocol) return { attempted: true, ticket: null }
+  const token = queryOk ? query : fromProtocol
+  if (!token) return { attempted: true, ticket: null }
+  const echoProtocol = fromProtocol
+    ? protocols.includes(COLLAB_TICKET_PROTOCOL)
+      ? COLLAB_TICKET_PROTOCOL
+      : fromProtocol
+    : null
+  return { attempted: true, ticket: { token, echoProtocol } }
+}
+
 function readClaims(
   payload: Record<string, unknown>,
   config: GatewayConfig,
-  now: number
+  now: number,
+  maxLifetimeSeconds: number
 ): { ok: true; claims: GatewayClaims } | { ok: false; reason: string } {
   if (payload.iss !== config.issuer) return { ok: false, reason: 'bad_iss' }
   if (!audienceMatches(payload.aud, config.audience)) return { ok: false, reason: 'bad_aud' }
@@ -197,6 +279,10 @@ function readClaims(
   const jti = boundedString(payload.jti)
   const rid = boundedString(payload.rid)
   if (!sub || !tid || !jti || !rid) return { ok: false, reason: 'bad_claims' }
+  const name = optionalBounded(payload.name)
+  const email = optionalBounded(payload.email)
+  if (name === 'invalid' || email === 'invalid') return { ok: false, reason: 'bad_claims' }
+  if (email && !isDisplayEmail(email)) return { ok: false, reason: 'bad_claims' }
   if (payload.hub_role !== 'member' && payload.hub_role !== 'admin') {
     return { ok: false, reason: 'bad_claims' }
   }
@@ -211,7 +297,7 @@ function readClaims(
   const exp = payload.exp
   if (typeof iat !== 'number' || typeof exp !== 'number') return { ok: false, reason: 'bad_claims' }
   if (!Number.isFinite(iat) || !Number.isFinite(exp)) return { ok: false, reason: 'bad_claims' }
-  if (exp < iat || exp - iat > GATEWAY_MAX_LIFETIME_SECONDS) {
+  if (exp < iat || exp - iat > maxLifetimeSeconds) {
     return { ok: false, reason: 'lifetime' }
   }
   if (iat > now + GATEWAY_CLOCK_SKEW_SECONDS) return { ok: false, reason: 'bad_iat' }
@@ -228,6 +314,8 @@ function readClaims(
       sub,
       tid,
       oid,
+      name,
+      email,
       hubRole: payload.hub_role,
       jti,
       rid,
@@ -241,6 +329,18 @@ function audienceMatches(aud: unknown, expected: string): boolean {
   if (typeof aud === 'string') return aud === expected
   if (!Array.isArray(aud)) return false
   return aud.some((entry) => entry === expected)
+}
+
+/** Absent claim, a bounded string, or `invalid` when the value is the wrong shape. */
+function optionalBounded(value: unknown): string | null | 'invalid' {
+  if (value === undefined || value === null) return null
+  return boundedString(value) ?? 'invalid'
+}
+
+/** Display address only. Not looked up against `users.email`. */
+function isDisplayEmail(value: string): boolean {
+  const at = value.indexOf('@')
+  return at > 0 && at === value.lastIndexOf('@') && at < value.length - 1
 }
 
 /** Exact, non-empty, no surrounding space, no control chars, bounded. */
@@ -266,7 +366,11 @@ type ImportedKey =
   | { ok: true; cryptoKey: CryptoKey; algorithm: VerifyAlgorithm }
   | { ok: false; reason: string }
 
-async function findVerifyKey(raw: string, kid: string, alg: 'ES256' | 'EdDSA'): Promise<ImportedKey> {
+async function findVerifyKey(
+  raw: string,
+  kid: string,
+  alg: 'ES256' | 'EdDSA'
+): Promise<ImportedKey> {
   let keys: PublicJwk[]
   try {
     keys = parseJwks(raw)
@@ -284,7 +388,11 @@ async function findVerifyKey(raw: string, kid: string, alg: 'ES256' | 'EdDSA'): 
         false,
         ['verify']
       )
-      return { ok: true, cryptoKey, algorithm: { name: 'ECDSA', hash: 'SHA-256' } as VerifyAlgorithm }
+      return {
+        ok: true,
+        cryptoKey,
+        algorithm: { name: 'ECDSA', hash: 'SHA-256' } as VerifyAlgorithm
+      }
     }
     if (alg === 'EdDSA' && jwk.kty === 'OKP' && jwk.crv === 'Ed25519' && jwk.x) {
       const cryptoKey = await crypto.subtle.importKey(

@@ -381,10 +381,14 @@ function UserDrawer({
         <Section title="Role">
           <Switch
             label="Administrator"
-            description="Admins can see the /app/admin/* surface, manage users, upstreams, and visibility."
+            description={
+              user.idp === 'kedi'
+                ? 'Kedi manages this role. Email invites do not admit gateway users.'
+                : 'Admins can see the /app/admin/* surface, manage users, upstreams, and visibility.'
+            }
             checked={isAdmin}
             onChange={(e) => toggleRole(e.currentTarget.checked)}
-            disabled={busy}
+            disabled={busy || user.idp === 'kedi'}
           />
         </Section>
 
@@ -417,7 +421,13 @@ function UserDrawer({
                     Reactivate
                   </Button>
                 ) : (
-                  <Button size="xs" variant="default" color="orange" onClick={suspend} disabled={busy}>
+                  <Button
+                    size="xs"
+                    variant="default"
+                    color="orange"
+                    onClick={suspend}
+                    disabled={busy}
+                  >
                     Suspend
                   </Button>
                 )}
@@ -527,4 +537,3 @@ function explain(err: unknown): string {
     400: (e) => bodyMessage(e) ?? 'Server rejected the request.'
   })
 }
-

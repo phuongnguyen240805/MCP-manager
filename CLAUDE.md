@@ -161,7 +161,14 @@ any of these on a new endpoint or proxy hop is a regression.
   only after signature, issuer, audience, lifetime, and tenant checks
   succeed. A bearer that does not verify must not skip CSRF, and must
   not fall through to the session cookie. Replay (`jti` in `OAUTH_KV`)
-  is enforced in `requireUser`. Unset gateway env leaves the path off.
+  is enforced in `requireUser`, once per Request — stacked `use('*')`
+  on the same prefix must not consume it again. Unset gateway env leaves
+  the path off. Collab from a Kedi origin uses a ≤60s ticket
+  (`?ticket=` or `Sec-WebSocket-Protocol`) plus
+  `KEDI_GATEWAY_ALLOWED_ORIGINS`. OAuth callbacks take the user from the
+  one-time KV state (`userId` + `tenant_id`); `redirect_uri` stays the
+  ctxlayer URL. `KEDI_GATEWAY_RETURN_ORIGINS` allowlists the bounce.
+  Optional `name` / `email` claims are display-only and are not join keys.
   A verified assertion also partitions that request: reads and writes of
   partitioned tables (`documents`, `skills`, `upstream_servers`, `users`,
   usage, audit, …) see only rows with `tenant_id` equal to `tid`

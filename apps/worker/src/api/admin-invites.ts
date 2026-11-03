@@ -1,7 +1,10 @@
 /**
  * Admin CRUD for invites (plan L admission). An invite pre-authorises an
- * email; a matching sign-in is admitted as `active`. All routes gated by
- * `requireAdmin` + router-wide `requireCsrf`; every mutation is audited.
+ * email; a matching cookie sign-in (Google, GitHub, Access) is admitted
+ * as `active`. Kedi gateway users are keyed by (issuer, subject, tenant),
+ * not email, so an invite for their address does not attach to that
+ * account. All routes gated by `requireAdmin` + router-wide `requireCsrf`;
+ * every mutation is audited.
  */
 
 import { Hono } from 'hono'

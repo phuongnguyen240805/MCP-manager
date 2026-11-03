@@ -50,8 +50,17 @@ async function resolveActiveUser(
   //    A presented bearer that fails does not fall through to the cookie.
   const gateway = await resolveFromGateway(c)
   if (gateway) return gateway
+  return resolveBrowserUser(c)
+}
 
-  // 1. Session cookie. Reached only when this request is not a gateway call.
+/**
+ * Cookie session, then Cloudflare Access. No gateway bearer. OAuth callbacks
+ * use this for the cookie dance so an IdP redirect is not treated as a
+ * gateway call and a bad assertion cannot satisfy the callback.
+ */
+export async function resolveBrowserUser(
+  c: Ctx
+): Promise<{ user: SessionUser; row: UserRow } | { error: Response }> {
   const cookie = readSessionCookie(c.req.raw)
   const payload = await verifySession(cookie, c.env.SESSION_COOKIE_SECRET)
   if (payload) {
@@ -68,9 +77,9 @@ async function resolveActiveUser(
     return { user: { userId: row.id, role: row.role }, row }
   }
 
-  // 2. No session yet — when deployed behind Cloudflare Access, mint one from
-  //    the edge-asserted identity. Only the first request of a session reaches
-  //    here; the cookie set below short-circuits every request after it.
+  // No session yet — when deployed behind Cloudflare Access, mint one from
+  // the edge-asserted identity. Only the first request of a session reaches
+  // here; the cookie set below short-circuits every request after it.
   if (accessTrustConfigured(c.env)) {
     const established = await establishFromAccess(c)
     if (established) return established
@@ -100,7 +109,9 @@ async function resolveFromGateway(
       issuer: decision.claims.iss,
       subject: decision.claims.sub,
       tenantId: decision.claims.tid,
-      hubRole: decision.claims.hubRole
+      hubRole: decision.claims.hubRole,
+      name: decision.claims.name,
+      email: decision.claims.email
     })
   } catch (err) {
     console.error(`[kedi-gateway] identity failed: ${errMessage(err)}`)
@@ -111,7 +122,7 @@ async function resolveFromGateway(
     return { error: c.json({ error: 'not_signed_in' }, 401) }
   }
 
-  const consumed = await consumeGatewayJti(c.env, decision.claims)
+  const consumed = await consumeGatewayJti(c.env, decision.claims, undefined, c.req.raw)
   if (consumed !== 'ok') {
     console.warn(`[kedi-gateway] reject reason=${consumed} rid=${safeRid(decision.claims.rid)}`)
     return { error: c.json({ error: 'not_signed_in' }, 401) }
@@ -202,10 +213,39 @@ async function establishFromAccess(
  *   route.use('*', requireUser)
  *   route.get('/', (c) => c.json({ userId: c.get('user').userId }))
  */
+function alreadyAuthed(c: Ctx): { user: SessionUser; row: UserRow } | null {
+  const user = c.get('user') as SessionUser | undefined
+  const row = c.get('userRow') as UserRow | undefined
+  if (!user?.userId || !row?.id) return null
+  return { user, row }
+}
+
+const OAUTH_CALLBACK_PATHS = new Set([
+  '/api/upstreams/oauth/callback',
+  '/api/git-sources/oauth/callback'
+])
+
+/**
+ * IdP redirects land on these GETs with no ctxlayer cookie and no bearer.
+ * Parent routers mounted on the same prefix must not run requireUser there;
+ * the callback identifies the user from the one-time KV state.
+ */
+export function skipGatewayOauthCallback<E extends { Bindings: Env; Variables: AuthedVariables }>(
+  mw: MiddlewareHandler<E>
+): MiddlewareHandler<E> {
+  return async (c, next) => {
+    if (OAUTH_CALLBACK_PATHS.has(c.req.path)) return next()
+    return mw(c, next)
+  }
+}
+
 export const requireUser: MiddlewareHandler<{
   Bindings: Env
   Variables: AuthedVariables
 }> = async (c, next) => {
+  // A second router on the same prefix (docs + editors/tags/git, upstreams
+  // + oauth start) would otherwise verify the assertion again and burn jti.
+  if (alreadyAuthed(c)) return next()
   const resolved = await resolveActiveUser(c)
   if ('error' in resolved) return resolved.error
   return continueAuthed(c, resolved, next)
@@ -216,6 +256,11 @@ export const requireAdmin: MiddlewareHandler<{
   Bindings: Env
   Variables: AuthedVariables
 }> = async (c, next) => {
+  const existing = alreadyAuthed(c)
+  if (existing) {
+    if (existing.user.role !== 'admin') return c.json({ error: 'forbidden' }, 403)
+    return next()
+  }
   const resolved = await resolveActiveUser(c)
   if ('error' in resolved) return resolved.error
   if (resolved.user.role !== 'admin') return c.json({ error: 'forbidden' }, 403)

@@ -60,8 +60,9 @@ export function AdminInvites() {
       </Title>
 
       <Text c="dimmed" fz="sm" mb="md">
-        Pre-authorise people by email. A matching sign-in is admitted automatically. Paste one or
-        many addresses (comma, space, or newline separated).
+        Pre-authorise people by email. A matching cookie sign-in is admitted automatically. Email
+        invites do not admit Kedi gateway users — Kedi owns that identity. Paste one or many
+        addresses (comma, space, or newline separated).
       </Text>
 
       <Stack gap="xs" mb="lg">

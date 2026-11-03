@@ -66,6 +66,8 @@ wrangler secret put KEDI_GATEWAY_ISSUER --env dev
 wrangler secret put KEDI_GATEWAY_AUDIENCE --env dev
 wrangler secret put KEDI_GATEWAY_PUBLIC_JWK --env dev
 wrangler secret put KEDI_GATEWAY_ALLOWED_TENANTS --env dev
+wrangler secret put KEDI_GATEWAY_ALLOWED_ORIGINS --env dev
+wrangler secret put KEDI_GATEWAY_RETURN_ORIGINS --env dev
 ```
 
 `ADMIN_EMAILS` và secret IdP (`GOOGLE_*`, `GITHUB_*`) chỉ cần khi đăng nhập
@@ -110,3 +112,22 @@ bun scripts/kedi-gateway-assertion.mjs --role admin --sub user_admin
 ```
 
 Cookie + `X-CSRF` không đổi khi request không gửi `Authorization`.
+
+`KEDI_GATEWAY_ALLOWED_ORIGINS` và `KEDI_GATEWAY_RETURN_ORIGINS` là origin
+đúng (`https://host`, không path), phân tách bằng dấu phẩy. Bỏ trống thì
+vé collab và trang quay OAuth của Kedi bị từ chối; cookie vẫn chạy.
+
+Nest cần khớp:
+
+- Claim tuỳ chọn `name`, `email` (hiển thị; không dùng email để nối tài khoản).
+- Collab: cùng assertion ES256, `exp - iat` ≤ 60 giây, một lần (`jti`).
+  `GET /collab/:docId?ticket=<jwt>` hoặc
+  `Sec-WebSocket-Protocol: ctxlayer.kedi-ticket, <jwt>` (server echo
+  `ctxlayer.kedi-ticket`). `Origin` nằm trong `KEDI_GATEWAY_ALLOWED_ORIGINS`.
+- OAuth `start` qua gateway: `200 { "authorizeUrl": "<url IdP>" }`, hoặc
+  `{ "connected": true }` khi token còn dùng được. Query `return_origin`
+  (hoặc header `Origin`) phải nằm trong `KEDI_GATEWAY_RETURN_ORIGINS`.
+  `return_to=admin` vẫn là path cũ (`/app/upstreams`, `/app/admin/upstreams`,
+  git: `/app/docs`, `/app/docs/:id`, `/app/admin/git-sources`) gắn lên origin đó.
+  `redirect_uri` đăng ký với IdP vẫn là URL ctxlayer
+  (`/api/upstreams/oauth/callback`, `/api/git-sources/oauth/callback`), không phải URL Nest.

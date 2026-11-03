@@ -29,6 +29,7 @@ import {
 } from '../db/queries/git-sources'
 import { staticOAuth, type StaticFlowProvider, type StaticOAuth } from '../upstream/oauth-static'
 import { openStoredTokens, prepareStoredTokens } from '../upstream/oauth-tokens'
+import type { GatewayOAuthBind } from '../auth/kedi-gateway'
 
 const VERIFIER_TTL_SECONDS = 600
 const REDIRECT_PATH = '/api/git-sources/oauth/callback'
@@ -45,6 +46,9 @@ interface StoredGitVerifier {
   gitSourceId: string
   return?: GitOAuthReturn
   createdAt: number
+  /** Set only for a gateway start. The callback has no session cookie. */
+  tenantId?: string
+  returnOrigin?: string
 }
 
 /** Parse a git CONNECTION's auth_config JSON (NULL / malformed ⇒ empty). */
@@ -75,7 +79,8 @@ export class GitOAuthFlowProvider implements StaticFlowProvider {
     private readonly userId: string,
     /** On the callback path, the `?state=` value; on start leave undefined. */
     presetState?: string,
-    private readonly returnCtx?: GitOAuthReturn
+    private readonly returnCtx?: GitOAuthReturn,
+    private readonly gateway?: GatewayOAuthBind
   ) {
     if (presetState) this.stateToken = presetState
   }
@@ -95,7 +100,9 @@ export class GitOAuthFlowProvider implements StaticFlowProvider {
       userId: this.userId,
       gitSourceId: this.source.id,
       return: this.returnCtx,
-      createdAt: Math.floor(Date.now() / 1000)
+      createdAt: Math.floor(Date.now() / 1000),
+      tenantId: this.gateway?.tenantId,
+      returnOrigin: this.gateway?.returnOrigin
     }
     await this.env.OAUTH_KV.put(verifierKey(this.state()), JSON.stringify(stored), {
       expirationTtl: VERIFIER_TTL_SECONDS
